@@ -1,0 +1,25 @@
+{
+  "name": "quotation-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && node scripts/prepare-sites-build.mjs",
+    "preview": "vite preview",
+    "test:sites": "node --test tests/sites-worker.test.mjs"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
+    "@phosphor-icons/react": "^2.1.10",
+    "@vitejs/plugin-react": "5.0.4",
+    "exceljs": "^4.4.0",
+    "jszip": "^3.10.1",
+    "pdfjs-dist": "^5.4.149",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "tesseract.js": "^6.0.1",
+    "vite": "6.4.2",
+    "xlsx": "^0.18.5"
+  }
+}

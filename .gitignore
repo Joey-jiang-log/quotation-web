@@ -1,0 +1,8 @@
+.vercel
+.env*
+node_modules/
+dist/
+data/quotation.sqlite*
+data/uploads/
+.ui-audit/
+.DS_Store

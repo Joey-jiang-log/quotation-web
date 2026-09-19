@@ -1,0 +1,4 @@
+node_modules
+dist
+data/quotation.sqlite*
+data/uploads
