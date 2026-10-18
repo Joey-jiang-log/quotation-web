@@ -10,6 +10,8 @@ import ExcelJS from "exceljs";
 import { searchExternalModels } from "./search.mjs";
 
 const SEARCH_PROVIDER_PREFIX = "Google UF 专项校对 v5";
+const MAX_BATCH_MODEL_QUERIES = 500;
+const MAX_WEB_BATCH_QUERIES = 40;
 
 const rootDir = process.cwd();
 const sourceDataDir = path.join(rootDir, "data");
@@ -37,6 +39,10 @@ function unique(values) {
   return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))];
 }
 
+function mergeTextValues(...values) {
+  return unique(values.flatMap((value) => String(value || "").split(/\s*(?:\/|,|，|;|；|\r?\n)\s*/))).join(" / ");
+}
+
 function compactReviewSource(source = {}) {
   const clean = String(source.snippet || source.url || "")
     .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
@@ -46,6 +52,15 @@ function compactReviewSource(source = {}) {
     .replace(/\s+/g, " ")
     .trim();
   return { ...source, snippet: clean.length > 520 ? `${clean.slice(0, 520)}…` : clean };
+}
+
+function productImagesFromSources(sources = []) {
+  return [...new Map(sources.flatMap((source) => (source.imageUrls || []).map((url) => [url, {
+    url,
+    platform: source.platform || source.provider || "Web",
+    sourceUrl: source.url,
+    title: source.title || "外网产品图片",
+  }])).values())].slice(0, 9);
 }
 
 function parseIdentifierList(value) {
@@ -76,8 +91,9 @@ function splitUniversalInputs(value) {
   if (!source) return [];
   const parts = source
     .replace(/[()（）]/g, " ")
-    .split(/\s*(?:\/|\bor\b|\band\b)\s*/i)
-    .map((item) => item.trim().replace(/^[,;，；]+|[,;，；]+$/g, ""))
+    .split(/\s*(?:\/|,|，|;|；|\||\r?\n|\bor\b|\band\b)\s*/i)
+    .map((item) => item.trim().replace(/^[,;，；|]+|[,;，；|]+$/g, ""))
+    .map((item) => item.replace(/^[A-Z][A-Z0-9 _-]{1,24}[:：]\s*(?=[A-Z0-9]*\d)/i, "").trim())
     .filter(isValidModelInput);
   return unique(parts.length ? parts : [source]);
 }
@@ -182,6 +198,51 @@ function parsePrices(bufferOrPath) {
   return prices;
 }
 
+function reviewModelCodes(value) {
+  return unique([...String(value || "").matchAll(/\bDQ[A-Z0-9-]*\d[A-Z0-9-]*\b/gi)].map((match) => match[0].toUpperCase()));
+}
+
+function parseMappingReview(bufferOrPath) {
+  const workbook = readWorkbook(bufferOrPath);
+  const decisions = [];
+  const mergedRelations = [];
+  for (const sheetName of workbook.SheetNames) {
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: "", raw: false });
+    const explicitHeaderIndex = rows.findIndex((row) => {
+      const headers = row.map((cell) => String(cell).trim());
+      return headers.some((header) => header.includes("确认型号")) && headers.some((header) => header.includes("备注")) && headers.some((header) => /OE号/i.test(header));
+    });
+    if (explicitHeaderIndex >= 0) {
+      const headers = rows[explicitHeaderIndex].map((cell) => String(cell).trim());
+      const oeCol = headers.findIndex((header) => /OE号/i.test(header));
+      const confirmCol = headers.findIndex((header) => header.includes("确认型号"));
+      const noteCol = headers.findIndex((header) => header.includes("备注"));
+      for (const row of rows.slice(explicitHeaderIndex + 1)) {
+        const oeNos = parseIdentifierList(row[oeCol]);
+        if (!oeNos.length) continue;
+        const confirmModels = reviewModelCodes(row[confirmCol]);
+        const note = String(row[noteCol] || "").trim();
+        decisions.push({ oeNos, confirmModels, note, sheetName, source: "备注核验" });
+      }
+      continue;
+    }
+    const mergedHeaderIndex = rows.findIndex((row) => {
+      const headers = row.map((cell) => String(cell).trim());
+      return headers.some((header) => header.includes("合并后内部型号")) && headers.some((header) => /OE号/i.test(header));
+    });
+    if (mergedHeaderIndex < 0) continue;
+    const headers = rows[mergedHeaderIndex].map((cell) => String(cell).trim());
+    const oeCol = headers.findIndex((header) => /OE号/i.test(header));
+    const mergedCol = headers.findIndex((header) => header.includes("合并后内部型号"));
+    for (const row of rows.slice(mergedHeaderIndex + 1)) {
+      const oeNos = parseIdentifierList(row[oeCol]);
+      const modelCodes = reviewModelCodes(row[mergedCol]);
+      if (oeNos.length && modelCodes.length) mergedRelations.push({ oeNos, modelCodes, sheetName, source: "双方合并复核" });
+    }
+  }
+  return { decisions, mergedRelations };
+}
+
 function setupSchema() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -205,6 +266,10 @@ function setupSchema() {
       id INTEGER PRIMARY KEY AUTOINCREMENT, model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
       kind TEXT NOT NULL, raw_value TEXT NOT NULL, normalized_value TEXT NOT NULL, confirmed_at TEXT NOT NULL,
       context TEXT NOT NULL DEFAULT '', reviewer TEXT NOT NULL DEFAULT '', is_new INTEGER NOT NULL DEFAULT 0, UNIQUE(model_id, kind, normalized_value)
+    );
+    CREATE TABLE IF NOT EXISTS mapping_review_decisions (
+      normalized_oe TEXT PRIMARY KEY, raw_oe TEXT NOT NULL, status TEXT NOT NULL,
+      model_ids TEXT NOT NULL DEFAULT '[]', note TEXT NOT NULL DEFAULT '', source_file TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS catalog_products (
       normalized_internal TEXT PRIMARY KEY, internal TEXT NOT NULL, common_name TEXT NOT NULL DEFAULT '', vehicle TEXT NOT NULL DEFAULT '',
@@ -237,6 +302,23 @@ function setupSchema() {
   ensureColumn("reviews", "verified_oe", "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn("reviews", "verified_uf", "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn("reviews", "platforms", "TEXT NOT NULL DEFAULT '[]'");
+  migratePricesToAppendOnly();
+}
+
+function migratePricesToAppendOnly() {
+  const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='prices'").get()?.sql || "";
+  const normalizedSchema = schema.replace(/\s+/g, " ").toUpperCase();
+  if (!normalizedSchema.includes("UNIQUE(NORMALIZED_INTERNAL, PACKAGING, TAX, TIER)")) return;
+  db.exec(`
+    CREATE TABLE prices_append_only (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, normalized_internal TEXT NOT NULL, packaging TEXT NOT NULL, tax TEXT NOT NULL, tier TEXT NOT NULL,
+      price REAL NOT NULL, attribute TEXT NOT NULL DEFAULT '', source_sheet TEXT NOT NULL, source_column TEXT NOT NULL
+    );
+    INSERT INTO prices_append_only(id, normalized_internal, packaging, tax, tier, price, attribute, source_sheet, source_column)
+      SELECT id, normalized_internal, packaging, tax, tier, price, attribute, source_sheet, source_column FROM prices;
+    DROP TABLE prices;
+    ALTER TABLE prices_append_only RENAME TO prices;
+  `);
 }
 
 setupSchema();
@@ -262,7 +344,8 @@ function refreshIdentifiers(modelId, model) {
 
 function upsertModels(models, sourceLabel, sourceType = "original") {
   let added = 0;
-  let updated = 0;
+  let supplemented = 0;
+  let preserved = 0;
   const now = new Date().toISOString();
   db.exec("BEGIN");
   try {
@@ -279,12 +362,28 @@ function upsertModels(models, sourceLabel, sourceType = "original") {
           webOeNos: json(existing.web_oe_nos),
           webUfNos: json(existing.web_uf_nos),
         };
-        db.prepare("UPDATE models SET product_codes=?, old_models=?, oe_nos=?, uf_nos=?, vehicle=?, category=?, source_label=?, captured_at=? WHERE id=?").run(
-          JSON.stringify(merged.productCodes), JSON.stringify(merged.oldModels), JSON.stringify(merged.oeNos), JSON.stringify(merged.ufNos),
-          incoming.vehicle || existing.vehicle, incoming.category || existing.category, sourceLabel, now, existing.id,
-        );
-        refreshIdentifiers(existing.id, merged);
-        updated += 1;
+        const vehicle = mergeTextValues(existing.vehicle, incoming.vehicle);
+        const category = mergeTextValues(existing.category, incoming.category);
+        const source = mergeTextValues(existing.source_label, sourceLabel);
+        const changed = [
+          [existing.product_codes, merged.productCodes],
+          [existing.old_models, merged.oldModels],
+          [existing.oe_nos, merged.oeNos],
+          [existing.uf_nos, merged.ufNos],
+          [existing.vehicle || "", vehicle],
+          [existing.category || "", category],
+          [existing.source_label || "", source],
+        ].some(([before, after]) => String(before) !== (Array.isArray(after) ? JSON.stringify(after) : String(after)));
+        if (changed) {
+          db.prepare("UPDATE models SET product_codes=?, old_models=?, oe_nos=?, uf_nos=?, vehicle=?, category=?, source_label=? WHERE id=?").run(
+            JSON.stringify(merged.productCodes), JSON.stringify(merged.oldModels), JSON.stringify(merged.oeNos), JSON.stringify(merged.ufNos),
+            vehicle, category, source, existing.id,
+          );
+          refreshIdentifiers(existing.id, { ...merged, vehicle, category });
+          supplemented += 1;
+        } else {
+          preserved += 1;
+        }
       } else {
         const result = db.prepare("INSERT INTO models(internal, normalized_internal, product_codes, old_models, oe_nos, uf_nos, vehicle, category, source_type, source_label, captured_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
           incoming.internal, key, JSON.stringify(incoming.productCodes), JSON.stringify(incoming.oldModels), JSON.stringify(incoming.oeNos), JSON.stringify(incoming.ufNos), incoming.vehicle, incoming.category, sourceType, sourceLabel, now,
@@ -298,20 +397,36 @@ function upsertModels(models, sourceLabel, sourceType = "original") {
     db.exec("ROLLBACK");
     throw error;
   }
-  return { added, updated, total: models.length };
+  return { added, supplemented, preserved, total: models.length };
 }
 
 function upsertPrices(prices) {
-  const statement = db.prepare("INSERT INTO prices(normalized_internal, packaging, tax, tier, price, attribute, source_sheet, source_column) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(normalized_internal, packaging, tax, tier) DO UPDATE SET price=excluded.price, attribute=CASE WHEN excluded.attribute<>'' THEN excluded.attribute ELSE prices.attribute END, source_sheet=excluded.source_sheet, source_column=excluded.source_column");
+  const sameKey = db.prepare("SELECT 1 FROM prices WHERE normalized_internal=? AND packaging=? AND tax=? AND tier=? LIMIT 1");
+  const exact = db.prepare("SELECT 1 FROM prices WHERE normalized_internal=? AND packaging=? AND tax=? AND tier=? AND price=? AND attribute=? AND source_sheet=? AND source_column=? LIMIT 1");
+  const statement = db.prepare("INSERT INTO prices(normalized_internal, packaging, tax, tier, price, attribute, source_sheet, source_column) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+  let added = 0;
+  let supplemented = 0;
+  let preserved = 0;
   db.exec("BEGIN");
   try {
-    for (const item of prices) statement.run(normalize(item.internal), item.packaging, item.tax, item.tier, item.price, item.attribute || "", item.sourceSheet, item.sourceColumn);
+    for (const item of prices) {
+      const key = [normalize(item.internal), item.packaging, item.tax, item.tier];
+      const values = [...key, item.price, item.attribute || "", item.sourceSheet, item.sourceColumn];
+      if (exact.get(...values)) {
+        preserved += 1;
+        continue;
+      }
+      const hadKey = Boolean(sameKey.get(...key));
+      statement.run(...values);
+      if (hadKey) supplemented += 1;
+      else added += 1;
+    }
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
   }
-  return { added: prices.length, updated: 0, total: prices.length };
+  return { added, supplemented, preserved, total: prices.length };
 }
 
 function parseCatalog(bufferOrPath) {
@@ -335,28 +450,58 @@ function upsertCatalog(records, sourceLabel) {
   const statement = db.prepare(`
     INSERT INTO catalog_products(normalized_internal, internal, common_name, vehicle, oe, note, image_url, image_data, source_sheet, source_row, source_label, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(normalized_internal) DO UPDATE SET internal=excluded.internal, common_name=excluded.common_name, vehicle=excluded.vehicle,
-      oe=excluded.oe, note=excluded.note, image_url=CASE WHEN excluded.image_url<>'' THEN excluded.image_url ELSE catalog_products.image_url END,
-      image_data=CASE WHEN excluded.image_data<>'' THEN excluded.image_data ELSE catalog_products.image_data END,
-      source_sheet=excluded.source_sheet, source_row=excluded.source_row, source_label=excluded.source_label, updated_at=excluded.updated_at
+    ON CONFLICT(normalized_internal) DO UPDATE SET
+      internal=excluded.internal, common_name=excluded.common_name, vehicle=excluded.vehicle, oe=excluded.oe, note=excluded.note,
+      image_url=CASE WHEN catalog_products.image_url='' THEN excluded.image_url ELSE catalog_products.image_url END,
+      image_data=CASE WHEN catalog_products.image_data='' THEN excluded.image_data ELSE catalog_products.image_data END,
+      source_sheet=excluded.source_sheet, source_row=excluded.source_row, source_label=excluded.source_label,
+      updated_at=catalog_products.updated_at
   `);
-  const existing = new Set(db.prepare("SELECT normalized_internal FROM catalog_products").all().map((item) => item.normalized_internal));
+  const existing = new Map(db.prepare("SELECT * FROM catalog_products").all().map((item) => [item.normalized_internal, item]));
   let added = 0;
-  let updated = 0;
+  let supplemented = 0;
+  let preserved = 0;
   const now = new Date().toISOString();
   db.exec("BEGIN");
   try {
     for (const item of records) {
-      statement.run(item.normalizedInternal, item.internal, item.commonName, item.vehicle, item.oe, item.note, item.imageUrl, item.imageData, item.sourceSheet, item.sourceRow, sourceLabel, now);
-      if (existing.has(item.normalizedInternal)) updated += 1;
-      else added += 1;
+      const previous = existing.get(item.normalizedInternal);
+      if (!previous) {
+        statement.run(item.normalizedInternal, item.internal, item.commonName, item.vehicle, item.oe, item.note, item.imageUrl, item.imageData, item.sourceSheet, item.sourceRow, sourceLabel, now);
+        added += 1;
+        continue;
+      }
+      const merged = {
+        internal: mergeTextValues(previous.internal, item.internal),
+        commonName: mergeTextValues(previous.common_name, item.commonName),
+        vehicle: mergeTextValues(previous.vehicle, item.vehicle),
+        oe: mergeTextValues(previous.oe, item.oe),
+        note: mergeTextValues(previous.note, item.note),
+        imageUrl: previous.image_url || item.imageUrl,
+        imageData: previous.image_data || item.imageData,
+        sourceSheet: mergeTextValues(previous.source_sheet, item.sourceSheet),
+        sourceRow: previous.source_row || item.sourceRow,
+        sourceLabel: mergeTextValues(previous.source_label, sourceLabel),
+      };
+      statement.run(item.normalizedInternal, merged.internal, merged.commonName, merged.vehicle, merged.oe, merged.note, merged.imageUrl, merged.imageData, merged.sourceSheet, merged.sourceRow, merged.sourceLabel, now);
+      const changed = [
+        [previous.internal, merged.internal], [previous.common_name, merged.commonName], [previous.vehicle, merged.vehicle], [previous.oe, merged.oe],
+        [previous.note, merged.note], [previous.source_sheet, merged.sourceSheet], [previous.source_row, merged.sourceRow], [previous.source_label, merged.sourceLabel],
+      ].some(([before, after]) => String(before || "") !== String(after || ""));
+      if (changed) supplemented += 1;
+      else preserved += 1;
+      existing.set(item.normalizedInternal, {
+        ...previous,
+        internal: merged.internal, common_name: merged.commonName, vehicle: merged.vehicle, oe: merged.oe, note: merged.note,
+        image_url: merged.imageUrl, image_data: merged.imageData, source_sheet: merged.sourceSheet, source_row: merged.sourceRow, source_label: merged.sourceLabel,
+      });
     }
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
   }
-  return { added, updated, total: records.length, images: records.filter((item) => item.imageUrl || item.imageData).length };
+  return { added, supplemented, preserved, total: records.length, images: records.filter((item) => item.imageUrl || item.imageData).length };
 }
 
 function catalogForInternal(internal) {
@@ -466,9 +611,9 @@ export function initKnowledgeBase() {
   migrateConfirmedReviewMappings();
 }
 
-const persistedTables = ["meta", "models", "identifiers", "confirmed_relations", "prices", "catalog_products", "reviews", "versions", "quote_jobs"];
-const deleteOrder = ["identifiers", "confirmed_relations", "reviews", "quote_jobs", "prices", "catalog_products", "versions", "models", "meta"];
-const insertOrder = ["meta", "models", "identifiers", "confirmed_relations", "prices", "catalog_products", "reviews", "versions", "quote_jobs"];
+const persistedTables = ["meta", "models", "mapping_review_decisions", "identifiers", "confirmed_relations", "prices", "catalog_products", "reviews", "versions", "quote_jobs"];
+const deleteOrder = ["mapping_review_decisions", "identifiers", "confirmed_relations", "reviews", "quote_jobs", "prices", "catalog_products", "versions", "models", "meta"];
+const insertOrder = ["meta", "models", "mapping_review_decisions", "identifiers", "confirmed_relations", "prices", "catalog_products", "reviews", "versions", "quote_jobs"];
 let persistentSql;
 let persistentReady;
 let localRevision = 0;
@@ -583,6 +728,33 @@ export async function withPersistentState(callback, { write = false } = {}) {
   });
 }
 
+const VEHICLE_TRANSLATIONS = [
+  ["梅赛德斯奔驰", "Mercedes-Benz"], ["奔驰", "Mercedes-Benz"], ["克莱斯勒", "Chrysler"], ["雪佛兰", "Chevrolet"], ["凯迪拉克", "Cadillac"],
+  ["丰田大发", "Toyota Daihatsu"], ["丰田", "Toyota"], ["大发", "Daihatsu"], ["本田", "Honda"], ["讴歌", "Acura"], ["日产", "Nissan"], ["尼桑", "Nissan"],
+  ["马自达", "Mazda"], ["雷克萨斯", "Lexus"], ["凌志", "Lexus"], ["三菱", "Mitsubishi"], ["斯巴鲁", "Subaru"], ["铃木", "Suzuki"],
+  ["现代", "Hyundai"], ["起亚", "Kia"], ["福特", "Ford"], ["雪铁龙", "Citroen"], ["标致", "Peugeot"], ["雷诺", "Renault"], ["欧宝", "Opel"],
+  ["宝马", "BMW"], ["保时捷", "Porsche"], ["沃尔沃", "Volvo"], ["大众", "Volkswagen"], ["捷豹", "Jaguar"], ["路虎", "Land Rover"],
+  ["道奇", "Dodge"], ["吉普", "Jeep"], ["Jeep", "Jeep"], ["五十铃", "Isuzu"], ["五菱", "Wuling"], ["比亚迪", "BYD"], ["吉利", "Geely"],
+  ["奇瑞", "Chery"], ["哈弗", "Haval"], ["长城", "Great Wall"], ["众泰", "Zotye"], ["传祺", "Trumpchi"], ["名爵", "MG"], ["荣威", "Roewe"],
+  ["一汽", "FAW"], ["上汽", "SAIC"], ["广汽", "GAC"], ["东风", "Dongfeng"], ["东南", "Soueast"], ["北汽", "BAIC"], ["江淮", "JAC"],
+  ["华晨", "Brilliance"], ["中华", "Brilliance"], ["猎豹", "Cheetah"], ["力帆", "Lifan"], ["海马", "Haima"], ["纳智捷", "Luxgen"], ["陆风", "Landwind"], ["长安", "Changan"], ["奔腾", "Bestune"], ["青年莲花", "Young Lotus"], ["三星", "Samsung"], ["高尔", "Golf"],
+  ["雅阁", "Accord"], ["思域", "Civic"], ["锋范", "City"], ["CRV", "CR-V"], ["凌派", "Crider"], ["智跑", "Sportage"], ["思铂睿", "Spirior"], ["飞度", "Fit"],
+  ["雅力士", "Yaris"], ["威驰", "Vios"], ["卡罗拉", "Corolla"], ["花冠", "Corolla"], ["凯美瑞", "Camry"], ["佳美", "Camry"], ["汉兰达", "Highlander"], ["皇冠", "Crown"], ["锐志", "Mark X"], ["塞纳", "Sienna"], ["普锐斯", "Prius"], ["陆地巡洋舰", "Land Cruiser"], ["霸道", "Prado"], ["大发特锐", "Daihatsu Terios"], ["特锐", "Terios"], ["雷凌", "Levin"],
+  ["欧蓝德", "Outlander"], ["帕杰罗", "Pajero"], ["蒙特罗", "Montero"], ["蓝瑟", "Lancer"], ["劲炫", "ASX"], ["伊柯丽斯", "Eclipse"], ["速跑", "Sport"], ["雨燕", "Swift"], ["天语", "SX4"], ["马六", "Mazda6"], ["昂克赛拉", "Mazda3 Axela"], ["玛驰", "March"], ["轩逸", "Sylphy"], ["骐达", "Tiida"], ["天籁", "Teana"], ["逍客", "Qashqai"], ["奇骏", "X-Trail"], ["风度", "Cefiro"], ["阳光", "Sunny"],
+  ["嘉年华", "Fiesta"], ["福克斯", "Focus"], ["蒙迪欧", "Mondeo"], ["翼虎", "Kuga"], ["锐界", "Edge"], ["探险者", "Explorer"], ["神探", "Explorer"], ["猎鹰", "Falcon"], ["领土", "Territory"], ["科鲁兹", "Cruze"], ["赛欧", "Sail"], ["迈锐宝", "Malibu"], ["科帕奇", "Captiva"], ["索罗德", "Silverado"], ["英帕拉", "Impala"], ["索尼克", "Sonic"], ["科迈罗", "Camaro"], ["拉赛蒂", "Lacetti"], ["英朗", "Excelle"], ["君威", "Regal"], ["君越", "LaCrosse"], ["昂科拉", "Encore"], ["伊兰特", "Elantra"], ["名图", "Mistra"],
+  ["自由光", "Cherokee"], ["指南者", "Compass"], ["自由客", "Patriot"], ["酷威", "Journey"], ["锋哲", "Avenger"], ["铂锐", "Sebring"], ["森林人", "Forester"], ["力狮", "Legacy"], ["翼豹", "Impreza"], ["帝豪", "Emgrand"], ["博越", "Boyue"], ["缤瑞", "Binrui"], ["缤越", "Binyue"], ["远景", "Vision"], ["瑞虎", "Tiggo"], ["风云", "Fengyun"], ["影豹", "Empow"], ["大迈", "Damai"], ["风骏", "Wingle"], ["大狗", "Big Dog"], ["宏光", "Hongguang"], ["荣光", "Rongguang"], ["凯捷", "Kaijie"], ["征程", "Journey"], ["杨光", "Sunshine"], ["森雅", "Xenia"], ["景逸", "Joyear"], ["菱智", "Lingzhi"], ["风光", "Fengon"], ["风神", "Aeolus"], ["骏捷", "Junjie"], ["尊驰", "Zunchi"],
+  ["发动机", "engine"], ["天然气", "CNG"], ["混合动力", "Hybrid"], ["手动", "Manual"], ["两厢", "Hatchback"], ["三厢", "Sedan"], ["进口", "Imported"], ["国内", "Domestic"], ["外贸", "Export"], ["日式", "Japanese style"], ["法式", "French style"], ["专用", "Dedicated"], ["红色", "Red"], ["黑色", "Black"], ["白色", "White"], ["蓝色", "Blue"], ["红插", "Red connector"], ["白插", "White connector"], ["黑插", "Black connector"], ["黑胶面", "Black rubber surface"], ["白胶面", "White rubber surface"], ["两插", "2-pin"], ["三插", "3-pin"], ["四孔", "4-hole"], ["三孔", "3-hole"], ["二针", "2-pin"], ["三针", "3-pin"], ["长杆", "Long stem"], ["短杆", "Short stem"], ["短", "Short"], ["前排", "Front row"], ["后排", "Rear row"], ["宽卡", "Wide clip"], ["系统", "system"], ["总成", "assembly"], ["新参数", "New spec"],
+];
+
+function vehicleToEnglish(value = "") {
+  let result = String(value || "").trim();
+  if (!result) return "";
+  for (const [source, target] of [...VEHICLE_TRANSLATIONS].sort((a, b) => b[0].length - a[0].length)) result = result.split(source).join(target);
+  result = result.replace(/(\d{4})年后/g, "after $1").replace(/(\d{2,4})款/g, "$1 model");
+  result = result.replace(/[（]/g, " (").replace(/[）]/g, ")").replace(/[、，]/g, ", ").replace(/[；;]/g, "; ").replace(/[：:]/g, ": ");
+  return result.replace(/\s+/g, " ").replace(/\(\s+/g, "(").replace(/\s+\)/g, ")").trim();
+}
+
 function serializeModel(row, matchedKind = "") {
   const rawOeNos = json(row.oe_nos);
   const rawUfNos = json(row.uf_nos);
@@ -592,6 +764,7 @@ function serializeModel(row, matchedKind = "") {
     id: row.id, internal: row.internal, productCodes: json(row.product_codes), oldModels: json(row.old_models),
     oeNos: rawOeNos.filter((item) => !/^UF/i.test(String(item).trim())),
     ufNos: unique([...rawUfNos, ...rawOeNos.filter((item) => /^UF/i.test(String(item).trim()))]), vehicle: row.vehicle, category: row.category,
+    vehicleEnglish: vehicleToEnglish(row.vehicle),
     webOeNos: rawWebOeNos.filter((item) => !/^UF/i.test(String(item).trim())),
     webUfNos: unique([...rawWebUfNos, ...rawWebOeNos.filter((item) => /^UF/i.test(String(item).trim()))]),
     sourceType: row.source_type, sourceLabel: row.source_label, sourceUrl: row.source_url, capturedAt: row.captured_at,
@@ -697,6 +870,165 @@ function addConfirmedInput(row, input, context = "型号查询", reviewer = "当
   return { ...relation, addedOldModels, addedOeNos, addedUfNos, normalizedLegacy, createdModel: Boolean(row.__created), changed: Boolean(row.__created || addedOldModels.length || addedOeNos.length || addedUfNos.length || normalizedLegacy) };
 }
 
+function resolveReviewModel(code) {
+  const key = normalize(code);
+  if (!key) return null;
+  const exact = db.prepare("SELECT * FROM models WHERE normalized_internal=?").get(key);
+  if (exact) return exact;
+  const aliases = db.prepare("SELECT DISTINCT m.* FROM identifiers i JOIN models m ON m.id=i.model_id WHERE i.normalized_value=? ORDER BY m.id").all(key);
+  if (aliases.length === 1) return aliases[0];
+  const prefixes = db.prepare("SELECT * FROM models WHERE normalized_internal LIKE ? ORDER BY LENGTH(normalized_internal), id").all(`${key}%`);
+  return prefixes.length === 1 ? prefixes[0] : null;
+}
+
+function savedMappingDecision(normalizedOe) {
+  const row = db.prepare("SELECT * FROM mapping_review_decisions WHERE normalized_oe=?").get(normalizedOe);
+  if (!row) return null;
+  return { ...row, modelIds: json(row.model_ids).map(Number).filter(Number.isFinite) };
+}
+
+function prepareMappingReview(parsed, filename) {
+  const decisionMap = new Map();
+  for (const item of parsed.decisions || []) {
+    for (const oe of item.oeNos || []) {
+      const normalizedOe = normalize(oe);
+      if (!normalizedOe) continue;
+      const note = String(item.note || "").trim();
+      const blockedByNote = /无法确认|无法查询/.test(note);
+      const directRows = unique(item.confirmModels || []).map(resolveReviewModel).filter(Boolean);
+      const fallbackRows = directRows.length ? [] : reviewModelCodes(note).map(resolveReviewModel).filter(Boolean);
+      const rows = [...new Map([...directRows, ...fallbackRows].map((row) => [row.id, row])).values()];
+      const unresolvedCodes = unique((directRows.length ? item.confirmModels : reviewModelCodes(note)).filter((code) => !resolveReviewModel(code)));
+      const status = blockedByNote ? "blocked" : rows.length ? "confirmed" : "unresolved";
+      decisionMap.set(normalizedOe, {
+        normalizedOe,
+        rawOe: oe,
+        status,
+        modelIds: rows.map((row) => row.id),
+        modelCodes: rows.map((row) => row.internal),
+        unresolvedCodes,
+        note,
+        sourceFile: filename,
+        authoritative: true,
+      });
+    }
+  }
+
+  const relationPairs = new Map();
+  const unresolvedCodes = new Set();
+  const addPair = (oe, modelId) => {
+    const key = `${modelId}|${normalize(oe)}`;
+    if (modelId && normalize(oe)) relationPairs.set(key, { oe, modelId });
+  };
+  for (const decision of decisionMap.values()) {
+    if (decision.status === "confirmed") decision.modelIds.forEach((modelId) => addPair(decision.rawOe, modelId));
+    decision.unresolvedCodes.forEach((code) => unresolvedCodes.add(code));
+  }
+  for (const item of parsed.mergedRelations || []) {
+    for (const oe of item.oeNos || []) {
+      const normalizedOe = normalize(oe);
+      const override = decisionMap.get(normalizedOe) || savedMappingDecision(normalizedOe);
+      if (override) {
+        if (override.status === "confirmed") override.modelIds.forEach((modelId) => addPair(oe, modelId));
+        continue;
+      }
+      for (const code of item.modelCodes || []) {
+        const row = resolveReviewModel(code);
+        if (row) addPair(oe, row.id);
+        else unresolvedCodes.add(code);
+      }
+    }
+  }
+
+  const currentPairs = new Set(db.prepare("SELECT model_id, normalized_value FROM identifiers WHERE kind='OE号'").all().map((row) => `${row.model_id}|${row.normalized_value}`));
+  const added = [...relationPairs.keys()].filter((key) => !currentPairs.has(key)).length;
+  let removed = 0;
+  for (const decision of decisionMap.values()) {
+    if (decision.status !== "confirmed") continue;
+    const selected = new Set(decision.modelIds);
+    removed += db.prepare("SELECT DISTINCT model_id FROM identifiers WHERE kind='OE号' AND normalized_value=?").all(decision.normalizedOe).filter((row) => !selected.has(row.model_id)).length;
+  }
+  const incomingOes = new Set([...(parsed.decisions || []).flatMap((item) => item.oeNos || []), ...(parsed.mergedRelations || []).flatMap((item) => item.oeNos || []).map((value) => String(value))].map(normalize).filter(Boolean));
+  const confirmed = [...decisionMap.values()].filter((item) => item.status === "confirmed").length;
+  const blocked = [...decisionMap.values()].filter((item) => item.status === "blocked").length;
+  const unresolved = [...decisionMap.values()].filter((item) => item.status === "unresolved").length;
+  const preserved = relationPairs.size - added;
+  return {
+    decisions: [...decisionMap.values()],
+    relationItems: [...relationPairs.values()],
+    summary: {
+      incoming: incomingOes.size,
+      existing: db.prepare("SELECT COUNT(*) AS count FROM models").get().count,
+      added,
+      supplemented: confirmed,
+      preserved: Math.max(0, preserved) + blocked,
+      conflicts: blocked + unresolved + unresolvedCodes.size,
+      confirmed,
+      blocked,
+      unresolved: unresolved + unresolvedCodes.size,
+      relations: relationPairs.size,
+      removed,
+      unresolvedModels: [...unresolvedCodes],
+      filename,
+    },
+  };
+}
+
+function removeOeRelation(modelId, normalizedOe) {
+  const row = db.prepare("SELECT * FROM models WHERE id=?").get(modelId);
+  if (!row) return false;
+  const key = normalize(normalizedOe);
+  const filter = (values) => json(values).filter((value) => normalize(value) !== key);
+  const nextOe = filter(row.oe_nos);
+  const nextUf = filter(row.uf_nos);
+  const nextWebOe = filter(row.web_oe_nos);
+  const nextWebUf = filter(row.web_uf_nos);
+  const changed = [nextOe.length !== json(row.oe_nos).length, nextUf.length !== json(row.uf_nos).length, nextWebOe.length !== json(row.web_oe_nos).length, nextWebUf.length !== json(row.web_uf_nos).length].some(Boolean);
+  if (!changed) return false;
+  db.prepare("UPDATE models SET oe_nos=?, uf_nos=?, web_oe_nos=?, web_uf_nos=?, captured_at=? WHERE id=?").run(JSON.stringify(nextOe), JSON.stringify(nextUf), JSON.stringify(nextWebOe), JSON.stringify(nextWebUf), new Date().toISOString(), modelId);
+  refreshIdentifiers(modelId, { internal: row.internal, productCodes: json(row.product_codes), oldModels: json(row.old_models), oeNos: nextOe, ufNos: nextUf, webOeNos: nextWebOe, webUfNos: nextWebUf });
+  db.prepare("DELETE FROM confirmed_relations WHERE model_id=? AND kind='OE号' AND normalized_value=?").run(modelId, key);
+  return true;
+}
+
+function applyMappingReviewParsed(parsed, filename, operator) {
+  const prepared = prepareMappingReview(parsed, filename);
+  let added = 0;
+  let removed = 0;
+  let confirmed = 0;
+  let blocked = 0;
+  let unresolved = 0;
+  let relationsAdded = 0;
+  db.exec("BEGIN");
+  try {
+    const saveDecision = db.prepare("INSERT INTO mapping_review_decisions(normalized_oe, raw_oe, status, model_ids, note, source_file, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(normalized_oe) DO UPDATE SET raw_oe=excluded.raw_oe, status=excluded.status, model_ids=excluded.model_ids, note=excluded.note, source_file=excluded.source_file, updated_at=excluded.updated_at");
+    for (const decision of prepared.decisions) {
+      saveDecision.run(decision.normalizedOe, decision.rawOe, decision.status, JSON.stringify(decision.modelIds), decision.note, filename, new Date().toISOString());
+      if (decision.status === "confirmed") {
+        confirmed += 1;
+        const selected = new Set(decision.modelIds);
+        const current = db.prepare("SELECT DISTINCT model_id FROM identifiers WHERE kind='OE号' AND normalized_value=?").all(decision.normalizedOe);
+        for (const row of current) if (!selected.has(row.model_id) && removeOeRelation(row.model_id, decision.normalizedOe)) removed += 1;
+      } else if (decision.status === "blocked") blocked += 1;
+      else unresolved += 1;
+    }
+    for (const item of prepared.relationItems) {
+      const row = db.prepare("SELECT * FROM models WHERE id=?").get(item.modelId);
+      if (!row) continue;
+      const relation = addConfirmedInput({ ...row, __created: false }, item.oe, "表格关系核验", operator, { oeNos: [item.oe] });
+      added += relation.addedOeNos.length;
+      relationsAdded += relation.addedOldModels.length + relation.addedOeNos.length + relation.addedUfNos.length;
+    }
+    const summary = { ...prepared.summary, added, removed, confirmed, blocked, unresolved, relationsAdded, total: db.prepare("SELECT COUNT(*) AS count FROM models").get().count };
+    const version = insertVersion("型号库", filename, operator, summary);
+    db.exec("COMMIT");
+    return { summary, version };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 function recordUserConfirmation(query, modelId, relation, context, reviewer = "当前用户") {
   const now = new Date().toISOString();
   db.prepare("INSERT INTO reviews(query, model_id, proposed_oe, proposed_uf, verified_oe, verified_uf, platforms, sources, confidence, search_provider, searched_at, status, reviewer, reviewed_at, note) VALUES (?, ?, ?, ?, ?, ?, '[]', '[]', 100, ?, ?, '已确认', ?, ?, ?)").run(
@@ -705,9 +1037,9 @@ function recordUserConfirmation(query, modelId, relation, context, reviewer = "�
   return now;
 }
 
-export function confirmUserMapping(input, targetInternal, context = "型号查询", reviewer = "当前用户") {
+export function confirmUserMapping(input, targetInternal, context = "型号查询", reviewer = "当前用户", extras = {}) {
   const row = ensureUserModel(targetInternal);
-  const relation = addConfirmedInput(row, input, context, reviewer);
+  const relation = addConfirmedInput(row, input, context, reviewer, extras);
   const confirmedAt = recordUserConfirmation(input, row.id, relation, context, reviewer);
   if (relation.changed) insertVersion("型号库", "大厂型号匹配（自动更新）.xlsx", reviewer, {
     added: relation.createdModel ? 1 : 0,
@@ -718,6 +1050,40 @@ export function confirmUserMapping(input, targetInternal, context = "型号查�
   });
   const updated = db.prepare("SELECT * FROM models WHERE id=?").get(row.id);
   return { model: serializeModel(updated, "用户确认"), confirmedAt, relation };
+}
+
+export function confirmMappingsBatch(items = [], context = "型号查询", reviewer = "当前用户") {
+  const normalizedItems = (Array.isArray(items) ? items : []).map((item) => ({
+    input: String(item?.input ?? item?.query ?? "").trim(),
+    targetInternal: String(item?.targetInternal ?? item?.internal ?? "").trim(),
+    oeNos: unique(Array.isArray(item?.oeNos) ? item.oeNos : []),
+    ufNos: unique(Array.isArray(item?.ufNos) ? item.ufNos : []),
+  })).filter((item) => item.input && item.targetInternal && item.targetInternal !== "未匹配" && item.targetInternal !== "待确认");
+  if (!normalizedItems.length) throw new Error("补充表格中没有可确认的内部型号关系");
+  const results = [];
+  let added = 0;
+  let updated = 0;
+  let relationsAdded = 0;
+  db.exec("BEGIN");
+  try {
+    for (const item of normalizedItems) {
+      const row = ensureUserModel(item.targetInternal);
+      const relation = addConfirmedInput(row, item.input, context, reviewer, item);
+      recordUserConfirmation(item.input, row.id, relation, context, reviewer);
+      if (relation.createdModel) added += 1; else if (relation.changed) updated += 1;
+      relationsAdded += relation.addedOldModels.length + relation.addedOeNos.length + relation.addedUfNos.length;
+      const updatedRow = db.prepare("SELECT * FROM models WHERE id=?").get(row.id);
+      results.push({ query: item.input, targetInternal: item.targetInternal, model: serializeModel(updatedRow, "用户确认"), relation });
+    }
+    insertVersion("型号库", "搜索结果补充匹配.xlsx", reviewer, {
+      added, updated, relationsAdded, total: db.prepare("SELECT COUNT(*) AS count FROM models").get().count, context,
+    });
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+  return { ok: true, count: results.length, results };
 }
 
 function resolveOeCandidates(models) {
@@ -749,7 +1115,18 @@ function existingReview(query, modelId) {
 async function createWebReview(query, local) {
   const existing = existingReview(query, local?.id);
   if (existing && String(existing.search_provider || "").startsWith(SEARCH_PROVIDER_PREFIX) && Date.now() - new Date(existing.searched_at).getTime() < 24 * 3600 * 1000) {
-    return { id: existing.id, query: existing.query, oeNos: json(existing.proposed_oe), ufNos: json(existing.proposed_uf), verifiedOeNos: json(existing.verified_oe), verifiedUfNos: json(existing.verified_uf), platforms: json(existing.platforms), sources: json(existing.sources), confidence: existing.confidence, provider: existing.search_provider, searchedAt: existing.searched_at, status: existing.status, error: existing.note };
+    const sources = json(existing.sources);
+    let productImages = productImagesFromSources(sources);
+    if (!productImages.length) {
+      const imageSearch = await searchExternalModels(query, {
+        vehicle: local?.vehicle || "",
+        internal: local?.internal || "",
+        oeNos: local?.oeNos || [],
+        ufNos: local?.ufNos || [],
+      });
+      productImages = imageSearch.productImages || [];
+    }
+    return { id: existing.id, query: existing.query, oeNos: json(existing.proposed_oe), ufNos: json(existing.proposed_uf), verifiedOeNos: json(existing.verified_oe), verifiedUfNos: json(existing.verified_uf), platforms: json(existing.platforms), sources, productImages, confidence: existing.confidence, provider: existing.search_provider, searchedAt: existing.searched_at, status: existing.status, error: existing.note };
   }
   const web = await searchExternalModels(query, {
     vehicle: local?.vehicle || "",
@@ -770,7 +1147,51 @@ async function createWebReview(query, local) {
   return { id: Number(result.lastInsertRowid), ...web, provider, oeNos, ufNos, verifiedOeNos, verifiedUfNos, status: "待校对" };
 }
 
-export async function searchModels(query, { includeWeb = true } = {}) {
+function mergeWebSupplements(items = []) {
+  const supplements = items.map((item) => item.webSupplement).filter(Boolean);
+  if (!supplements.length) return null;
+  const sources = [...new Map(supplements.flatMap((item) => item.sources || []).map((source) => [source.url || JSON.stringify(source), source])).values()];
+  const platforms = unique(supplements.flatMap((item) => item.platforms || []));
+  const oeNos = unique(supplements.flatMap((item) => item.oeNos || []));
+  const ufNos = unique(supplements.flatMap((item) => item.ufNos || []));
+  const verifiedOeNos = unique(supplements.flatMap((item) => item.verifiedOeNos || []));
+  const verifiedUfNos = unique(supplements.flatMap((item) => item.verifiedUfNos || []));
+  const productImages = productImagesFromSources(supplements.flatMap((item) => item.sources || []));
+  const confidenceValues = supplements.map((item) => Number(item.confidence)).filter(Number.isFinite);
+  return {
+    ...supplements[0],
+    query: items.map((item) => item.query).join(" / "),
+    sources,
+    platforms,
+    oeNos,
+    ufNos,
+    verifiedOeNos,
+    verifiedUfNos,
+    productImages,
+    confidence: confidenceValues.length ? Math.round(confidenceValues.reduce((sum, value) => sum + value, 0) / confidenceValues.length) : 0,
+    status: supplements.some((item) => item.status === "待校对") ? "待校对" : supplements[0].status,
+  };
+}
+
+function crossValidationFor(aliasResults = []) {
+  const modelSets = aliasResults.map((item) => new Set((item.local || []).map((model) => model.id))).filter((set) => set.size);
+  const commonModelIds = modelSets.length === aliasResults.length
+    ? [...modelSets[0]].filter((id) => modelSets.every((set) => set.has(id)))
+    : [];
+  const commonInternal = commonModelIds.length
+    ? aliasResults[0].local.find((model) => model.id === commonModelIds[0])?.internal || ""
+    : "";
+  return {
+    items: aliasResults.map((item) => ({
+      query: item.query,
+      local: (item.local || []).map((model) => ({ id: model.id, internal: model.internal, matchedKind: model.matchedKind })),
+      webSupplement: item.webSupplement || null,
+    })),
+    summary: { status: commonModelIds.length ? "通过" : "需校对", commonInternal, commonModelIds },
+  };
+}
+
+async function searchModelsSingle(query, { includeWeb = true } = {}) {
   const lookup = findUniversalLocal(query);
   const found = lookup.models;
   const resolution = lookup.universal
@@ -779,17 +1200,66 @@ export async function searchModels(query, { includeWeb = true } = {}) {
   const local = resolution.selected ? [resolution.selected, ...found.filter((item) => item.id !== resolution.selected.id)] : found;
   const needsWeb = includeWeb && isValidModelInput(query) && (!local.length || local.some((item) => !item.oeNos.length || !item.ufNos.length));
   const webQuery = lookup.aliases[0] || query;
+  const webContext = { vehicle: local[0]?.vehicle || "", internal: local[0]?.internal || "", oeNos: local[0]?.oeNos || [], ufNos: local[0]?.ufNos || [] };
   const webSupplement = needsWeb ? await createWebReview(webQuery, local[0]) : null;
-  return { query, aliases: lookup.aliases, universal: lookup.universal, local, preferredModelId: resolution.selected?.id || null, preferenceReason: resolution.reason, webSupplement, searchedAt: new Date().toISOString() };
+  const imageSearch = includeWeb && local.length > 1 && !webSupplement ? await searchExternalModels(query, webContext) : null;
+  return { query, aliases: lookup.aliases, universal: lookup.universal, local, preferredModelId: resolution.selected?.id || null, preferenceReason: resolution.reason, webSupplement, productImages: webSupplement?.productImages || imageSearch?.productImages || [], searchedAt: new Date().toISOString() };
+}
+
+export async function searchModels(query, { includeWeb = true } = {}) {
+  const aliases = splitUniversalInputs(query);
+  if (aliases.length < 2) return searchModelsSingle(query, { includeWeb });
+  const aliasResults = await runPool(aliases, 8, (alias) => searchModelsSingle(alias, { includeWeb }));
+  const lookup = findUniversalLocal(query);
+  const collected = new Map();
+  for (const result of aliasResults) {
+    for (const model of result.local || []) {
+      const existing = collected.get(model.id);
+      if (existing) existing.matchedAliases = unique([...(existing.matchedAliases || []), result.query]);
+      else collected.set(model.id, { ...model, matchedAliases: [result.query] });
+    }
+  }
+  const found = [...collected.values()];
+  const resolution = found.length === 1
+    ? { selected: found[0], reason: `多个 OE 号交叉验证均命中 ${found[0].internal}` }
+    : { selected: null, reason: found.length > 1 ? "多个 OE 号匹配到不同内部型号，请校对" : "" };
+  const crossValidation = crossValidationFor(aliasResults);
+  const webSupplement = mergeWebSupplements(aliasResults);
+  let productImages = webSupplement?.productImages || [];
+  if (includeWeb && found.length > 1 && !productImages.length) {
+    const imageSearch = await searchExternalModels(query, { oeNos: lookup.aliases });
+    productImages = imageSearch.productImages || [];
+  }
+  return {
+    query,
+    aliases: lookup.aliases,
+    universal: true,
+    local: resolution.selected ? [resolution.selected, ...found.filter((item) => item.id !== resolution.selected.id)] : found,
+    preferredModelId: resolution.selected?.id || null,
+    preferenceReason: resolution.reason,
+    crossValidation: crossValidation.items,
+    crossValidationSummary: crossValidation.summary,
+    webSupplement,
+    productImages,
+    searchedAt: new Date().toISOString(),
+  };
 }
 
 export async function searchModelsBatch(queries, { includeWeb = true } = {}) {
   const submitted = unique((queries || []).map((value) => String(value).trim()));
-  const cleaned = submitted.filter(isValidModelInput).slice(0, 50);
+  const cleaned = submitted.filter(isValidModelInput).slice(0, MAX_BATCH_MODEL_QUERIES);
   const ignoredQueries = submitted.filter((value) => !isValidModelInput(value));
   if (!cleaned.length) throw new Error("请输入至少一个型号");
-  const results = await runPool(cleaned, 10, (query) => searchModels(query, { includeWeb }));
-  return { queries: cleaned, ignoredQueries, results, searchedAt: new Date().toISOString() };
+  const webEnabled = includeWeb && cleaned.length <= MAX_WEB_BATCH_QUERIES;
+  const results = await runPool(cleaned, 10, (query) => searchModels(query, { includeWeb: webEnabled }));
+  return {
+    queries: cleaned,
+    ignoredQueries,
+    results,
+    searchedAt: new Date().toISOString(),
+    searchMode: webEnabled ? "local-and-web" : "local-only",
+    searchModeNote: webEnabled ? "已完成本地匹配，并联网补齐缺失字段" : `本次共 ${cleaned.length} 个型号，已完成本地知识库批量匹配；为避免批量联网超时，缺失项未逐条联网搜索。`,
+  };
 }
 
 export function cleanupInvalidPendingReviews(reviewer = "系统自动清理") {
@@ -824,7 +1294,11 @@ export function getOverview() {
 }
 
 export function listReviews() {
-  return db.prepare("SELECT r.*, m.internal, m.vehicle FROM reviews r LEFT JOIN models m ON m.id=r.model_id ORDER BY CASE r.status WHEN '待校对' THEN 0 ELSE 1 END, r.id DESC LIMIT 100").all().map((row) => {
+  const rows = [
+    ...db.prepare("SELECT r.*, m.internal, m.vehicle FROM reviews r LEFT JOIN models m ON m.id=r.model_id WHERE r.status='待校对' ORDER BY r.id DESC LIMIT 100").all(),
+    ...db.prepare("SELECT r.*, m.internal, m.vehicle FROM reviews r LEFT JOIN models m ON m.id=r.model_id WHERE r.status='已确认' ORDER BY r.reviewed_at DESC, r.id DESC LIMIT 100").all(),
+  ];
+  return rows.map((row) => {
     const verifiedUf = json(row.verified_uf);
     const rawProposedUf = json(row.proposed_uf);
     const noisyLegacyUf = /Google UF 专项校对 v4/.test(row.search_provider || "") && rawProposedUf.length > 2 && !verifiedUf.length;
@@ -978,6 +1452,8 @@ function missingPriceIssue(prices, prefix = "已匹配内部型号") {
 async function mapQuoteLine(input, original, pricings) {
   const lookup = findUniversalLocal(input, { exact: true });
   const found = lookup.models;
+  const crossValidation = lookup.universal ? crossValidationFor(lookup.aliases.map((query) => ({ query, local: findLocalExact(query), webSupplement: null }))) : null;
+  const validationFields = crossValidation ? { crossValidation: crossValidation.items, crossValidationSummary: crossValidation.summary } : {};
   const resolution = lookup.universal
     ? { candidates: found, selected: found.length === 1 ? found[0] : null, reason: found.length > 1 ? "通用型号分别匹配到不同内部型号，请选择" : found.length === 1 ? `通用型号 ${found[0].matchedAliases?.join(" / ")} 命中` : "" }
     : resolveOeCandidates(found);
@@ -986,47 +1462,51 @@ async function mapQuoteLine(input, original, pricings) {
     const prices = pricesForInternal(model.internal, pricings);
     const catalog = catalogForInternal(model.internal);
     return {
-      modelId: model.id, internal: model.internal, oe: model.oeNos.join(" / "), uf: model.ufNos.join(" / "), vehicle: model.vehicle,
+      modelId: model.id, internal: model.internal, oe: model.oeNos.join(" / "), uf: model.ufNos.join(" / "), vehicle: model.vehicle, vehicleEnglish: vehicleToEnglish(model.vehicle),
       matchedKind: model.matchedKind, prices, price: prices[0]?.price ?? null, priceSource: prices[0]?.source || "",
       attribute: attributeFromPrices(prices),
       catalogImage: catalog?.image || "", catalogName: catalog?.commonName || "", catalogSource: catalog?.sourceSheet || "",
       modelSource: model.sourceType === "original" ? "原始匹配表" : model.sourceType === "user_confirmed" ? "用户确认" : "外网补充",
     };
   });
+  const multipleImageSearch = candidateOptions.length > 1 && isValidModelInput(input)
+    ? await searchExternalModels(input, { oeNos: candidateOptions.flatMap((item) => item.oe.split(" / ")).slice(0, 6) })
+    : null;
   if (resolution.selected && candidateOptions.length === 1) {
     const selected = candidateOptions[0];
     return {
-      original, input, internal: selected.internal, oe: selected.oe, uf: selected.uf, vehicle: selected.vehicle, attribute: selected.attribute, prices: selected.prices, price: selected.price,
+      original, input, internal: selected.internal, oe: selected.oe, uf: selected.uf, vehicle: selected.vehicle, vehicleEnglish: selected.vehicleEnglish, attribute: selected.attribute, prices: selected.prices, price: selected.price,
       catalogImage: selected.catalogImage, catalogName: selected.catalogName, catalogSource: selected.catalogSource,
       priceSource: selected.priceSource, modelSource: selected.modelSource, reviewStatus: "已确认", selectedModelId: selected.modelId,
       matchedKind: selected.matchedKind, candidateOptions, selectionReason: resolution.reason,
+      ...validationFields,
       issue: missingPriceIssue(selected.prices),
     };
   }
   if (candidateOptions.length > 1) {
     return {
-      original, input, internal: "待选择", oe: "", uf: "", vehicle: "", attribute: "", prices: emptyPrices(pricings), price: null, priceSource: "", catalogImage: "", catalogName: "", catalogSource: "", modelSource: "原始匹配表",
-      reviewStatus: "待选择", issue: "匹配到多个内部型号，请选择", matchedKind: candidateOptions[0].matchedKind, candidateOptions, selectionReason: resolution.reason,
+      original, input, internal: "待选择", oe: "", uf: "", vehicle: "", vehicleEnglish: "", attribute: "", prices: emptyPrices(pricings), price: null, priceSource: "", catalogImage: "", catalogName: "", catalogSource: "", modelSource: "原始匹配表",
+      reviewStatus: "待选择", issue: "匹配到多个内部型号，请选择", matchedKind: candidateOptions[0].matchedKind, candidateOptions, selectionReason: resolution.reason, productImages: multipleImageSearch?.productImages || [], ...validationFields,
     };
   }
   if (candidateOptions.length === 1) {
     const selected = candidateOptions[0];
     return {
-      original, input, internal: selected.internal, oe: selected.oe, uf: selected.uf, vehicle: selected.vehicle, attribute: selected.attribute, prices: selected.prices, price: selected.price,
+      original, input, internal: selected.internal, oe: selected.oe, uf: selected.uf, vehicle: selected.vehicle, vehicleEnglish: selected.vehicleEnglish, attribute: selected.attribute, prices: selected.prices, price: selected.price,
       catalogImage: selected.catalogImage, catalogName: selected.catalogName, catalogSource: selected.catalogSource,
       priceSource: selected.priceSource, modelSource: selected.modelSource, reviewStatus: "已确认", selectedModelId: selected.modelId,
-      matchedKind: selected.matchedKind, candidateOptions, issue: missingPriceIssue(selected.prices),
+      matchedKind: selected.matchedKind, candidateOptions, ...validationFields, issue: missingPriceIssue(selected.prices),
     };
   }
   if (!isValidModelInput(input)) {
-    return { original, input, internal: "", oe: "", uf: "", vehicle: "", attribute: "", prices: emptyPrices(pricings), price: null, priceSource: "", catalogImage: "", catalogName: "", catalogSource: "", modelSource: "未匹配", reviewStatus: "", issue: "该内容不像有效型号，未发起联网搜索", candidateOptions: [] };
+    return { original, input, internal: "", oe: "", uf: "", vehicle: "", vehicleEnglish: "", attribute: "", prices: emptyPrices(pricings), price: null, priceSource: "", catalogImage: "", catalogName: "", catalogSource: "", modelSource: "未匹配", reviewStatus: "", issue: "该内容不像有效型号，未发起联网搜索", candidateOptions: [], productImages: [] };
   }
   const webSupplement = await createWebReview(input, null);
   const issue = webSupplement?.sources?.length ? "本地型号库未匹配，已发起联网补充" : "本地与外网均未找到可靠型号";
   return {
-    original, input, internal: "待确认", oe: webSupplement?.oeNos?.join(" / ") || "", uf: webSupplement?.ufNos?.join(" / ") || "", vehicle: "", attribute: "", prices: emptyPrices(pricings), price: null,
+    original, input, internal: "待确认", oe: webSupplement?.oeNos?.join(" / ") || "", uf: webSupplement?.ufNos?.join(" / ") || "", vehicle: "", vehicleEnglish: "", attribute: "", prices: emptyPrices(pricings), price: null,
     catalogImage: "", catalogName: "", catalogSource: "",
-    priceSource: "", modelSource: webSupplement?.sources?.length ? "外网补充" : "未匹配", reviewStatus: webSupplement?.status || "待补充", issue, candidateOptions: [],
+    priceSource: "", modelSource: webSupplement?.sources?.length ? "外网补充" : "未匹配", reviewStatus: webSupplement?.status || "待补充", issue, candidateOptions: [], productImages: webSupplement?.productImages || [], ...validationFields,
   };
 }
 
@@ -1063,7 +1543,7 @@ export async function previewQuote(buffer, filename, pricingInput) {
   const lines = await runPool(sourceRows.slice(0, 500), 4, async ({ row, sourceRow }) => {
     const original = Object.fromEntries(inquiry.headers.map((header, index) => [header, row[index] ?? ""]));
     const input = String(row[inquiry.modelColumn] || "").trim();
-    const line = input ? await mapQuoteLine(input, original, pricings) : { original, input: "", internal: "", oe: "", uf: "", vehicle: "", attribute: "", prices: emptyPrices(pricings), price: null, priceSource: "", catalogImage: "", catalogName: "", catalogSource: "", modelSource: "未匹配", reviewStatus: "", issue: "型号为空" };
+    const line = input ? await mapQuoteLine(input, original, pricings) : { original, input: "", internal: "", oe: "", uf: "", vehicle: "", vehicleEnglish: "", attribute: "", prices: emptyPrices(pricings), price: null, priceSource: "", catalogImage: "", catalogName: "", catalogSource: "", modelSource: "未匹配", reviewStatus: "", issue: "型号为空" };
     return { ...line, sourceRow };
   });
   const id = randomUUID();
@@ -1088,7 +1568,7 @@ export function selectQuoteCandidate(id, lineIndex, modelId) {
   const selected = line.candidateOptions?.find((item) => Number(item.modelId) === Number(modelId));
   if (!selected) throw new Error("所选内部型号不在候选列表中");
   Object.assign(line, {
-    internal: selected.internal, oe: selected.oe, uf: selected.uf, vehicle: selected.vehicle, attribute: selected.attribute || attributeFromPrices(selected.prices), prices: selected.prices || [], price: selected.price,
+    internal: selected.internal, oe: selected.oe, uf: selected.uf, vehicle: selected.vehicle, vehicleEnglish: selected.vehicleEnglish, attribute: selected.attribute || attributeFromPrices(selected.prices), prices: selected.prices || [], price: selected.price,
     catalogImage: selected.catalogImage || "", catalogName: selected.catalogName || "", catalogSource: selected.catalogSource || "",
     priceSource: selected.priceSource, modelSource: selected.modelSource, selectedModelId: selected.modelId,
     matchedKind: selected.matchedKind, reviewStatus: "已确认", issue: missingPriceIssue(selected.prices || [], "所选内部型号"),
@@ -1115,6 +1595,7 @@ export function confirmQuoteLine(id, lineIndex, targetInternal, reviewer = "当�
     oe: model.oeNos.join(" / "),
     uf: model.ufNos.join(" / "),
     vehicle: model.vehicle,
+    vehicleEnglish: model.vehicleEnglish || vehicleToEnglish(model.vehicle),
     attribute: attributeFromPrices(prices),
     prices,
     price: prices[0]?.price ?? null,
@@ -1122,13 +1603,70 @@ export function confirmQuoteLine(id, lineIndex, targetInternal, reviewer = "当�
     catalogImage: catalog?.image || "",
     catalogName: catalog?.commonName || "",
     catalogSource: catalog?.sourceSheet || "",
-    modelSource: model.sourceType === "user_confirmed" ? "用户确认" : model.sourceType === "original" ? "原始匹配表" : "外网补充",
+    modelSource: "用户确认",
     selectedModelId: model.id,
     matchedKind: "用户确认",
     reviewStatus: "已确认",
     candidateOptions: [],
+    supplemented: true,
     issue: missingPriceIssue(prices, "已确认内部型号"),
   });
+  refreshQuoteMetrics(result);
+  db.prepare("UPDATE quote_jobs SET result_json=? WHERE id=?").run(JSON.stringify(result), id);
+  return result;
+}
+
+function applyConfirmedQuoteModel(line, model, pricings, matchedKind = "补充导入") {
+  const prices = pricesForInternal(model.internal, pricings);
+  const catalog = catalogForInternal(model.internal);
+  Object.assign(line, {
+    internal: model.internal,
+    oe: model.oeNos.join(" / "),
+    uf: model.ufNos.join(" / "),
+    vehicle: model.vehicle,
+    vehicleEnglish: model.vehicleEnglish || vehicleToEnglish(model.vehicle),
+    attribute: attributeFromPrices(prices),
+    prices,
+    price: prices[0]?.price ?? null,
+    priceSource: prices[0]?.source || "",
+    catalogImage: catalog?.image || "",
+    catalogName: catalog?.commonName || "",
+    catalogSource: catalog?.sourceSheet || "",
+    modelSource: "用户确认",
+    selectedModelId: model.id,
+    matchedKind,
+    reviewStatus: "已确认",
+    candidateOptions: [],
+    selectionReason: "上传补充表确认",
+    supplemented: true,
+    issue: missingPriceIssue(prices, "已确认内部型号"),
+  });
+  return line;
+}
+
+export function supplementQuoteJob(id, items = [], reviewer = "当前用户") {
+  const row = db.prepare("SELECT * FROM quote_jobs WHERE id=?").get(id);
+  if (!row) throw new Error("报价任务不存在");
+  const result = json(row.result_json, {});
+  const pricings = normalizePricings(result.pricings || result.pricing || {});
+  const updates = Array.isArray(items) ? items : [];
+  let count = 0;
+  for (const item of updates) {
+    const lineIndex = Number(item?.lineIndex);
+    const line = Number.isInteger(lineIndex) ? result.lines?.[lineIndex] : null;
+    if (!line) continue;
+    const targetInternal = String(item?.targetInternal ?? item?.internal ?? "").trim();
+    if (!targetInternal || targetInternal === "未匹配" || targetInternal === "待确认") continue;
+    const input = String(item?.input || line.input || "").trim();
+    if (!input) continue;
+    const confirmation = confirmUserMapping(input, targetInternal, "报价补充", reviewer, {
+      oeNos: unique(Array.isArray(item?.oeNos) ? item.oeNos : []),
+      ufNos: unique(Array.isArray(item?.ufNos) ? item.ufNos : []),
+    });
+    applyConfirmedQuoteModel(line, confirmation.model, pricings);
+    count += 1;
+  }
+  if (!count) throw new Error("没有识别到可合并的报价补充关系");
   refreshQuoteMetrics(result);
   db.prepare("UPDATE quote_jobs SET result_json=? WHERE id=?").run(JSON.stringify(result), id);
   return result;
@@ -1185,7 +1723,7 @@ export async function exportQuote(id) {
       dynamicPrices[`${label}价格来源`] = item.source || "";
     });
     return {
-      ...line.original, "客户询价图片": line.customerImageValidated && line.customerImage ? "已嵌入" : "", "匹配内部型号": line.internal, "属性（自制/调货）": line.attribute || "", "产品目录图片": line.catalogImage ? "已嵌入" : "暂无图片", "匹配OE号": line.oe, "匹配UF号": line.uf, "适用车型": line.vehicle,
+      ...line.original, "客户询价图片": line.customerImageValidated && line.customerImage ? "已嵌入" : "", "匹配内部型号": line.internal, "属性（自制/调货）": line.attribute || "", "产品目录图片": line.catalogImage ? "已嵌入" : "暂无图片", "匹配OE号": line.oe, "匹配UF号": line.uf, "适用车型": line.vehicle, "适用车型（英文）": line.vehicleEnglish || vehicleToEnglish(line.vehicle),
       "匹配依据": line.matchedKind ? `通过${line.matchedKind}命中` : "", ...dynamicPrices, "型号来源": line.modelSource, "校对状态": line.reviewStatus, "异常说明": line.issue,
     };
   });
@@ -1212,14 +1750,61 @@ const pendingImports = new Map();
 
 export function previewKnowledgeImport(buffer, filename, type) {
   const token = randomUUID();
+  if (type === "relations") {
+    const parsed = parseMappingReview(buffer);
+    const prepared = prepareMappingReview(parsed, filename);
+    pendingImports.set(token, { buffer, filename, type, parsed, summary: prepared.summary, createdAt: Date.now() });
+    return { token, type, filename, ...prepared.summary };
+  }
   const parsed = type === "models" ? parseModels(buffer) : type === "catalog" ? parseCatalog(buffer) : parsePrices(buffer);
   const existingCount = type === "models" ? db.prepare("SELECT COUNT(*) AS count FROM models").get().count : type === "catalog" ? db.prepare("SELECT COUNT(*) AS count FROM catalog_products").get().count : db.prepare("SELECT COUNT(*) AS count FROM prices").get().count;
   const incomingKeys = new Set(parsed.map((item) => type === "models" ? normalize(item.internal) : type === "catalog" ? item.normalizedInternal : `${normalize(item.internal)}|${item.packaging}|${item.tax}|${item.tier}`));
-  const existingRows = type === "models" ? db.prepare("SELECT normalized_internal AS key FROM models").all() : type === "catalog" ? db.prepare("SELECT normalized_internal AS key FROM catalog_products").all() : db.prepare("SELECT normalized_internal || '|' || packaging || '|' || tax || '|' || tier AS key FROM prices").all();
-  const existingKeys = new Set(existingRows.map((row) => row.key));
+  const existingRows = type === "models" ? db.prepare("SELECT * FROM models").all() : type === "catalog" ? db.prepare("SELECT * FROM catalog_products").all() : db.prepare("SELECT *, normalized_internal || '|' || packaging || '|' || tax || '|' || tier AS key FROM prices").all();
+  const existingKeys = new Set(existingRows.map((row) => type === "models" ? row.normalized_internal : type === "catalog" ? row.normalized_internal : row.key));
   const added = [...incomingKeys].filter((key) => !existingKeys.has(key)).length;
-  const updated = [...incomingKeys].filter((key) => existingKeys.has(key)).length;
-  const summary = { incoming: parsed.length, existing: existingCount, added, updated, conflicts: 0 };
+  const incomingByKey = new Map(parsed.map((item) => [type === "models" ? normalize(item.internal) : type === "catalog" ? item.normalizedInternal : `${normalize(item.internal)}|${item.packaging}|${item.tax}|${item.tier}`, item]));
+  const existingByKey = new Map();
+  for (const row of existingRows) {
+    const key = type === "models" ? row.normalized_internal : type === "catalog" ? row.normalized_internal : row.key;
+    if (type === "prices") {
+      const rows = existingByKey.get(key) || [];
+      rows.push(row);
+      existingByKey.set(key, rows);
+    } else {
+      existingByKey.set(key, row);
+    }
+  }
+  let supplemented = 0;
+  let preserved = 0;
+  for (const [key, item] of incomingByKey) {
+    const previous = existingByKey.get(key);
+    if (!previous) continue;
+    if (type === "models") {
+      const hasNew = [
+        [json(previous.product_codes), item.productCodes], [json(previous.old_models), item.oldModels],
+        [json(previous.oe_nos), item.oeNos], [json(previous.uf_nos), item.ufNos],
+      ].some(([before, after]) => after.some((value) => !before.includes(value)))
+        || mergeTextValues(previous.vehicle, item.vehicle) !== String(previous.vehicle || "")
+        || mergeTextValues(previous.category, item.category) !== String(previous.category || "");
+      if (hasNew) supplemented += 1;
+      else preserved += 1;
+    } else if (type === "catalog") {
+      const changed = [
+        [previous.internal, mergeTextValues(previous.internal, item.internal)], [previous.common_name, mergeTextValues(previous.common_name, item.commonName)],
+        [previous.vehicle, mergeTextValues(previous.vehicle, item.vehicle)], [previous.oe, mergeTextValues(previous.oe, item.oe)],
+        [previous.note, mergeTextValues(previous.note, item.note)], [previous.source_sheet, mergeTextValues(previous.source_sheet, item.sourceSheet)],
+        [previous.source_row, previous.source_row || item.sourceRow], [previous.source_label, mergeTextValues(previous.source_label, filename)],
+      ].some(([before, after]) => String(before || "") !== String(after || ""));
+      if (changed) supplemented += 1;
+      else preserved += 1;
+    } else {
+      const rows = previous || [];
+      const sameValue = rows.some((row) => Number(row.price) === Number(item.price) && String(row.attribute || "") === String(item.attribute || "") && String(row.source_sheet || "") === String(item.sourceSheet || "") && String(row.source_column || "") === String(item.sourceColumn || ""));
+      if (sameValue) preserved += 1;
+      else supplemented += 1;
+    }
+  }
+  const summary = { incoming: parsed.length, existing: existingCount, added, supplemented, preserved, conflicts: 0 };
   pendingImports.set(token, { buffer, filename, type, parsed, summary, createdAt: Date.now() });
   return { token, type, filename, ...summary };
 }
@@ -1230,13 +1815,23 @@ export function applyKnowledgeImport(token, operator = "当前用户") {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const safeName = pending.filename.replace(/[^\p{L}\p{N}._-]/gu, "_");
   fs.writeFileSync(path.join(uploadDir, `${stamp}-${safeName}`), pending.buffer);
-  const summary = pending.type === "models" ? upsertModels(pending.parsed, pending.filename) : pending.type === "catalog" ? upsertCatalog(pending.parsed, pending.filename.replace(/\.catalog\.json$/i, "")) : upsertPrices(pending.parsed);
-  const version = insertVersion(pending.type === "models" ? "型号库" : pending.type === "catalog" ? "产品目录" : "价格库", pending.filename.replace(/\.catalog\.json$/i, ""), operator, summary);
+  const relationResult = pending.type === "relations" ? applyMappingReviewParsed(pending.parsed, pending.filename, operator) : null;
+  const summary = relationResult?.summary || (pending.type === "models" ? upsertModels(pending.parsed, pending.filename) : pending.type === "catalog" ? upsertCatalog(pending.parsed, pending.filename.replace(/\.catalog\.json$/i, "")) : upsertPrices(pending.parsed));
+  const version = relationResult?.version || insertVersion(pending.type === "models" ? "型号库" : pending.type === "catalog" ? "产品目录" : "价格库", pending.filename.replace(/\.catalog\.json$/i, ""), operator, summary);
   pendingImports.delete(token);
   return { ok: true, version, summary };
 }
 
 export function applyKnowledgeFile(buffer, filename, type, operator = "当前用户") {
+  if (type === "relations") {
+    const parsed = parseMappingReview(buffer);
+    if (!(parsed.decisions.length || parsed.mergedRelations.length)) throw new Error("文件中没有识别到关系核验数据");
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const safeName = filename.replace(/[^\p{L}\p{N}._-]/gu, "_");
+    fs.writeFileSync(path.join(uploadDir, `${stamp}-${safeName}`), buffer);
+    const result = applyMappingReviewParsed(parsed, filename, operator);
+    return { ok: true, version: result.version, summary: result.summary };
+  }
   const parsed = type === "models" ? parseModels(buffer) : type === "catalog" ? parseCatalog(buffer) : parsePrices(buffer);
   if (!parsed.length) throw new Error("文件中没有识别到可导入的数据");
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -1337,11 +1932,12 @@ export async function exportKnowledge(type) {
       { packaging: "中性", tax: "未税", sheet: "中未价-最新" },
     ];
     for (const context of contexts) {
-      const source = db.prepare("SELECT normalized_internal, tier, price, attribute FROM prices WHERE packaging=? AND tax=? ORDER BY normalized_internal").all(context.packaging, context.tax);
+      const source = db.prepare("SELECT normalized_internal, tier, price, attribute FROM prices WHERE packaging=? AND tax=? ORDER BY normalized_internal, id").all(context.packaging, context.tax);
       const grouped = new Map();
       for (const row of source) {
         const item = grouped.get(row.normalized_internal) || { 对外型号: row.normalized_internal, 属性: row.attribute || "" };
-        item[row.tier] = row.price;
+        item[row.tier] = mergeTextValues(item[row.tier], row.price);
+        item.属性 = mergeTextValues(item.属性, row.attribute);
         grouped.set(row.normalized_internal, item);
       }
       const rows = [...grouped.values()].map((item) => ({ 对外型号: item.对外型号, NP: item.NP ?? "", LP: item.LP ?? "", SLP: item.SLP ?? "", "2S": item["2S"] ?? "", "3S": item["3S"] ?? "", "4S": item["4S"] ?? "", 属性: item.属性 }));
@@ -1364,5 +1960,25 @@ export function exportConfirmedReviews() {
   const worksheet = XLSX.utils.json_to_sheet(rows.length ? rows : [{ 对外型号: "", OE号: "", UF号: "", 确认时间: "" }]);
   worksheet["!cols"] = [{ wch: 20 }, { wch: 40 }, { wch: 28 }, { wch: 22 }];
   XLSX.utils.book_append_sheet(workbook, worksheet, "确认记录");
+  return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+}
+
+export function exportPendingReviews() {
+  const rows = db.prepare("SELECT r.*, m.internal FROM reviews r LEFT JOIN models m ON m.id=r.model_id WHERE r.status='待校对' ORDER BY r.id DESC").all().map((row) => ({
+    查询编号: row.query,
+    内部型号: row.internal || "待识别",
+    OE号: json(row.proposed_oe).join(" / "),
+    UF号: json(row.proposed_uf).join(" / "),
+    已验证OE号: json(row.verified_oe).join(" / "),
+    已验证UF号: json(row.verified_uf).join(" / "),
+    平台: json(row.platforms).join(" / "),
+    置信度: row.confidence ?? "",
+    查询时间: row.searched_at ? new Date(row.searched_at).toLocaleString("zh-CN", { hour12: false }) : "",
+    备注: row.note || "",
+  }));
+  const workbook = XLSX.utils.book_new();
+  const worksheet = XLSX.utils.json_to_sheet(rows.length ? rows : [{ 查询编号: "", 内部型号: "", OE号: "", UF号: "", 已验证OE号: "", 已验证UF号: "", 平台: "", 置信度: "", 查询时间: "", 备注: "" }]);
+  worksheet["!cols"] = [{ wch: 24 }, { wch: 18 }, { wch: 38 }, { wch: 28 }, { wch: 38 }, { wch: 28 }, { wch: 22 }, { wch: 10 }, { wch: 22 }, { wch: 42 }];
+  XLSX.utils.book_append_sheet(workbook, worksheet, "待校对队列");
   return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
 }

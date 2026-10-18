@@ -32,6 +32,7 @@ import {
 import { api } from "./api";
 import * as XLSX from "xlsx";
 import { extractInquiryRows, isSupportedQuoteFile, prepareQuoteFile, quoteFileType } from "./quote-file-parser";
+import { extractIdentifierTokens } from "./inquiry-text-parser";
 import { prepareKnowledgeFile } from "./knowledge-file-parser";
 
 const NAV_ITEMS = [
@@ -49,6 +50,8 @@ const PAGE_META = {
   reviews: ["二次校对", "审核外网补充关系，确认后再进入正式知识库"],
   knowledge: ["知识库", "查看版本并上传新的型号表、价格表或产品目录"],
 };
+
+const MAX_BATCH_MODEL_QUERIES = 500;
 
 function formatDate(value) {
   if (!value) return "—";
@@ -80,7 +83,7 @@ function useStoredState(key, initialValue) {
 }
 
 function splitModelQueries(value) {
-  return [...new Set(String(value || "").split(/[\n,，;；]+/).map((item) => item.trim()).filter(Boolean))].slice(0, 50);
+  return [...new Set(String(value || "").split(/[\n,，;；]+/).map((item) => item.trim()).filter(Boolean))].slice(0, MAX_BATCH_MODEL_QUERIES);
 }
 
 function normalizeTextInquiry(value) {
@@ -108,8 +111,27 @@ function remainingTrashDays(item) {
 async function extractModelQueriesFromFile(file, onProgress) {
   const prepared = await prepareQuoteFile(file, onProgress);
   const workbook = XLSX.read(await prepared.file.arrayBuffer(), { type: "array", raw: false });
+  const queries = [];
+  const normalizedHeader = (value) => String(value || "").trim().toUpperCase().replace(/[\s._/\\-]+/g, "");
+  for (const sheetName of workbook.SheetNames) {
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: "", raw: false });
+    const headerRow = rows.findIndex((row) => row.some((cell) => /(?:对外型号|内部型号|客户型号|OE号|OE NUMBER|OEM NUMBER)/i.test(String(cell || ""))));
+    if (headerRow < 0) continue;
+    const headers = rows[headerRow].map((cell) => normalizedHeader(cell));
+    const internalColumn = headers.findIndex((header) => /^(?:对外型号|内部型号|客户型号|产品型号|型号)$/.test(header));
+    const oeColumn = headers.findIndex((header) => /^(?:OE号|OEM号|OENUMBER|OENO|OEMNUMBER|OEMNO|OE|OEM)$/.test(header));
+    if (oeColumn < 0 && internalColumn < 0) continue;
+    for (const row of rows.slice(headerRow + 1)) {
+      const internal = internalColumn >= 0 ? extractIdentifierTokens(row[internalColumn]) : [];
+      const oeNos = oeColumn >= 0 ? extractIdentifierTokens(row[oeColumn]) : [];
+      const aliases = oeNos.length ? oeNos : internal.slice(0, 1);
+      if (!aliases.length) continue;
+      queries.push(aliases.length > 1 ? aliases.join(" / ") : aliases[0]);
+    }
+  }
+  if (queries.length) return [...new Set(queries)].slice(0, MAX_BATCH_MODEL_QUERIES);
   const text = workbook.SheetNames.map((name) => XLSX.utils.sheet_to_csv(workbook.Sheets[name])).join("\n");
-  return [...new Set(extractInquiryRows(text).map((row) => row.客户型号).filter(Boolean))].slice(0, 50);
+  return [...new Set(extractInquiryRows(text).map((row) => row.客户型号).filter(Boolean))].slice(0, MAX_BATCH_MODEL_QUERIES);
 }
 
 function RecycleBin({ items, onRestore, onDelete }) {
@@ -141,6 +163,7 @@ function quoteDownloadRows(result) {
       匹配OE号: line.oe,
       匹配UF号: line.uf,
       适用车型: line.vehicle,
+      "适用车型（英文）": line.vehicleEnglish || "",
       匹配依据: line.selectionReason || (line.matchedKind ? `通过${line.matchedKind}命中` : ""),
       ...priceColumns,
       型号来源: line.modelSource,
@@ -159,6 +182,46 @@ function quotePricingLabels(result) {
 function quoteLinePrices(line, result) {
   if (line?.prices?.length) return line.prices;
   return [{ label: result?.pricingLabel || "报价", price: line?.price ?? null, source: line?.priceSource || "" }];
+}
+
+function isUnresolvedModelResult(item) {
+  return !item?.local?.length || item.local.length > 1;
+}
+
+function isUnresolvedQuoteLine(line) {
+  return Boolean(line?.input) && (line?.reviewStatus !== "已确认" || !line?.selectedModelId || line?.candidateOptions?.length > 1);
+}
+
+function supplementHeaderKey(value) {
+  return String(value || "").trim().toUpperCase().replace(/[\s._/\\-]+/g, "");
+}
+
+async function parseSupplementRows(file, type) {
+  const workbook = XLSX.read(await file.arrayBuffer(), { type: "array", raw: false });
+  const rows = [];
+  for (const sheetName of workbook.SheetNames) {
+    const sheetRows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: "", raw: false });
+    const headerRow = sheetRows.findIndex((row) => row.some((cell) => /查询输入|客户输入|报价行号|匹配内部型号|补充内部型号/i.test(String(cell || ""))));
+    if (headerRow < 0) continue;
+    const headers = sheetRows[headerRow].map(supplementHeaderKey);
+    const column = (pattern) => headers.findIndex((header) => pattern.test(header));
+    const queryColumn = column(/^(?:查询输入|客户输入|型号|OE号|OENUMBER|OEMNUMBER)$/);
+    const internalColumn = column(/^(?:匹配内部型号|补充内部型号|内部型号|目标内部型号)$/);
+    const oeColumn = column(/^(?:补充OE号|匹配OE号|OE号|OENUMBER|OEMNUMBER)$/);
+    const ufColumn = column(/^(?:补充UF号|匹配UF号|UF号)$/);
+    const lineColumn = type === "quote" ? column(/^(?:报价行号|行号|LINE)$/) : -1;
+    if (queryColumn < 0 || internalColumn < 0) continue;
+    for (const row of sheetRows.slice(headerRow + 1)) {
+      const input = String(row[queryColumn] || "").trim();
+      const targetInternal = String(row[internalColumn] || "").trim();
+      if (!input || !targetInternal || /^(?:未匹配|待确认|待识别|—|-)$/.test(targetInternal)) continue;
+      const oeNos = extractIdentifierTokens(oeColumn >= 0 ? row[oeColumn] : "").filter((value) => !/^UF/i.test(value));
+      const ufNos = extractIdentifierTokens(ufColumn >= 0 ? row[ufColumn] : "").filter((value) => /^UF/i.test(value));
+      const lineIndex = lineColumn >= 0 ? Number(row[lineColumn]) - 1 : -1;
+      rows.push({ input, targetInternal, oeNos, ufNos, ...(type === "quote" ? { lineIndex } : {}) });
+    }
+  }
+  return rows;
 }
 
 function Badge({ tone = "blue", children, icon: Icon }) {
@@ -312,8 +375,12 @@ function ModelSearch({ onReviewCreated, showToast }) {
   const [draggingFile, setDraggingFile] = useState(false);
   const [fileState, setFileState] = useState({ stage: "", progress: 0 });
   const [trashOpen, setTrashOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [manualInputs, setManualInputs] = useState({});
   const [confirming, setConfirming] = useState("");
+  const [supplementing, setSupplementing] = useState(false);
+  const [editingModelQuery, setEditingModelQuery] = useState("");
+  const [modelEditInputs, setModelEditInputs] = useState({});
   const modelTrash = useMemo(() => validTrashItems(trash).filter((item) => item.type === "model"), [trash]);
   useEffect(() => { setTrash((items) => validTrashItems(items)); }, [setTrash]);
   const search = async (value = query) => {
@@ -332,10 +399,73 @@ function ModelSearch({ onReviewCreated, showToast }) {
   const downloadResult = (data = result) => {
     if (!data) return;
     const rows = data.results.flatMap((item) => item.local.length ? item.local.map((model) => { const codes = classifiedModelCodes(model); return ({
-      查询输入: item.query, 内部型号: model.internal, OE号: codes.oeNos.join(" / "), UF号: codes.ufNos.join(" / "), 适用车型: model.vehicle,
+      查询输入: item.query, 内部型号: model.internal, OE号: codes.oeNos.join(" / "), UF号: codes.ufNos.join(" / "), 适用车型: model.vehicle, "适用车型（英文）": model.vehicleEnglish || "",
       命中依据: model.matchedKind, 选择规则: item.preferredModelId === model.id ? item.preferenceReason : "", 来源: model.webOeNos.length || model.webUfNos.length ? "原始表 + 外网确认" : "原始匹配表", 状态: model.reviewStatus,
     }); }) : [{ 查询输入: item.query, 内部型号: "未匹配", OE号: item.webSupplement?.oeNos?.filter((value) => !/^UF/i.test(value))?.join(" / ") || "", UF号: [...(item.webSupplement?.ufNos || []), ...(item.webSupplement?.oeNos || []).filter((value) => /^UF/i.test(value))].join(" / "), 来源: item.webSupplement?.sources?.length ? "外网候选" : "未匹配", 状态: item.webSupplement?.status || "" }]);
     downloadXlsx(rows, `型号查询-${new Date().toISOString().slice(0, 10)}.xlsx`, "型号查询");
+  };
+  const downloadUnmatched = (data = result) => {
+    if (!data) return;
+    const rows = data.results.filter(isUnresolvedModelResult).map((item) => {
+      const localCodes = item.local.flatMap((model) => {
+        const codes = classifiedModelCodes(model);
+        return [...codes.oeNos, ...codes.ufNos];
+      });
+      const webCodes = [...(item.webSupplement?.oeNos || []), ...(item.webSupplement?.ufNos || [])];
+      const candidates = item.local.map((model) => model.internal).join(" / ");
+      return {
+        查询输入: item.query,
+        匹配内部型号: "",
+        候选内部型号: candidates,
+        补充OE号: [...new Set([...localCodes, ...webCodes].filter((value) => !/^UF/i.test(value)))].join(" / "),
+        补充UF号: [...new Set([...localCodes, ...webCodes].filter((value) => /^UF/i.test(value)))].join(" / "),
+        状态: item.local.length > 1 ? "多个匹配" : "未匹配",
+      };
+    });
+    downloadXlsx(rows, `型号查询-未精准匹配-${new Date().toISOString().slice(0, 10)}.xlsx`, "待补充");
+  };
+  const uploadModelSupplement = async (file) => {
+    if (!file) return;
+    setSupplementing(true);
+    try {
+      const items = await parseSupplementRows(file, "model");
+      if (!items.length) throw new Error("补充表中没有识别到“查询输入”和“匹配内部型号”");
+      const response = await api.confirmMappingsBatch(items, "型号查询补充");
+      const confirmations = new Map(response.results.map((item) => [item.query, item.model]));
+      const nextResult = { ...result, results: result.results.map((item) => {
+        const model = confirmations.get(item.query);
+        return model ? { ...item, local: [model], preferredModelId: model.id, preferenceReason: "上传补充确认（可再次编辑）" } : item;
+      }) };
+      setResult(nextResult);
+      setHistory((items) => items.map((historyItem) => historyItem.data?.searchedAt === result.searchedAt ? { ...historyItem, data: nextResult } : historyItem));
+      onReviewCreated();
+      showToast(`已合并 ${response.count} 条补充关系，并写入知识库`);
+    } catch (error) { showToast(error.message, "error"); }
+    finally { setSupplementing(false); }
+  };
+  const beginModelEdit = (item) => {
+    const model = item.local.find((candidate) => candidate.id === item.preferredModelId) || item.local[0];
+    if (!model) return;
+    const codes = classifiedModelCodes(model);
+    setEditingModelQuery(item.query);
+    setModelEditInputs({ internal: model.internal, oe: codes.oeNos.join(" / "), uf: codes.ufNos.join(" / ") });
+  };
+  const saveModelEdit = async (item) => {
+    const targetInternal = String(modelEditInputs.internal || "").trim();
+    if (!targetInternal) return showToast("请输入内部型号", "error");
+    setConfirming(`edit-${item.query}`);
+    try {
+      const oeNos = extractIdentifierTokens(modelEditInputs.oe || "").filter((value) => !/^UF/i.test(value));
+      const ufNos = extractIdentifierTokens(modelEditInputs.uf || "").filter((value) => /^UF/i.test(value));
+      const confirmation = await api.confirmMapping(item.query, targetInternal, "型号查询补充编辑", { oeNos, ufNos });
+      const nextResult = { ...result, results: result.results.map((resultItem) => resultItem.query === item.query ? { ...resultItem, local: [confirmation.model], preferredModelId: confirmation.model.id, preferenceReason: "用户补充关系（可再次编辑）" } : resultItem) };
+      setResult(nextResult);
+      setHistory((items) => items.map((historyItem) => historyItem.data?.searchedAt === result.searchedAt ? { ...historyItem, data: nextResult } : historyItem));
+      setEditingModelQuery("");
+      onReviewCreated();
+      showToast("补充关系已更新");
+    } catch (error) { showToast(error.message, "error"); }
+    finally { setConfirming(""); }
   };
   const loadQueryFile = async (file) => {
     if (!file) return;
@@ -399,7 +529,7 @@ function ModelSearch({ onReviewCreated, showToast }) {
   return (
     <div className="content-stack">
       <section className="search-hero panel">
-        <div className="search-copy"><Badge tone="blue" icon={MagnifyingGlass}>批量智能匹配</Badge><h2>多个型号，一次查全关联关系</h2><p>每行一个型号，或用逗号、分号分隔；单次最多 50 个。</p></div>
+        <div className="search-copy"><Badge tone="blue" icon={MagnifyingGlass}>批量智能匹配</Badge><h2>多个型号，一次查全关联关系</h2><p>每行一个型号，或用逗号、分号分隔；单次最多 500 个。同一单元格内的多个 OE 号会分别匹配并交叉验证。超过 40 个时先完成本地批量匹配，避免逐条联网导致超时。</p></div>
         <form className="model-search batch-search" onSubmit={(event) => { event.preventDefault(); search(); }}>
           <MagnifyingGlass size={22} />
           <textarea value={query} onChange={(event) => setQuery(event.target.value)} placeholder={"输入内部型号、OE 号或 UF 号\n例如：DQ910844；90919-02244；UF333"} autoFocus />
@@ -414,21 +544,39 @@ function ModelSearch({ onReviewCreated, showToast }) {
 
       {loading && <section className="panel searching-panel"><div className="searching-steps"><span className="done"><Check size={15} />规范化输入</span><span className="done"><Check size={15} />检索本地型号库</span><span className="active"><SpinnerGap className="spin" size={15} />联网补齐缺失字段</span><span>生成可追溯结果</span></div></section>}
 
-      {(history.length > 0 || modelTrash.length > 0) && <section className="panel compact-history"><div className="panel-heading"><div><h2>最近型号查询</h2><p>保存在当前浏览器，最多 20 条</p></div><button className="secondary-button" onClick={() => setTrashOpen((value) => !value)}><Trash size={15} />回收站 {modelTrash.length || ""}</button></div>{history.length > 0 && <div className="history-chips">{history.slice(0, 8).map((item) => <div key={item.id}><button onClick={() => { setResult(item.data); setQuery(item.data.queries.join("\n")); }}><ClockCounterClockwise size={15} /><span><strong>{item.label}</strong><small>{formatDate(item.createdAt)}</small></span></button><button className="icon-button history-delete" title="移入回收站" onClick={() => deleteHistory(item)}><Trash size={15} /></button></div>)}</div>}{trashOpen && <RecycleBin items={modelTrash} onRestore={restoreHistory} onDelete={permanentlyDeleteHistory} />}</section>}
+      {(history.length > 0 || modelTrash.length > 0) && <section className="panel compact-history"><div className="panel-heading"><div><h2>最近型号查询</h2><p>保存在当前浏览器，最多 20 条</p></div><div className="history-heading-actions"><button className="secondary-button" onClick={() => setHistoryOpen((value) => !value)}><CaretDown className={historyOpen ? "rotated" : ""} size={15} />{historyOpen ? "收起记录" : `展开记录${history.length ? `（${history.length}）` : ""}`}</button><button className="secondary-button" onClick={() => setTrashOpen((value) => !value)}><Trash size={15} />回收站 {modelTrash.length || ""}</button></div></div>{historyOpen && history.length > 0 && <div className="history-chips">{history.slice(0, 8).map((item) => <div key={item.id}><button onClick={() => { setResult(item.data); setQuery(item.data.queries.join("\n")); }}><ClockCounterClockwise size={15} /><span><strong>{item.label}</strong><small>{formatDate(item.createdAt)}</small></span></button><button className="icon-button history-delete" title="移入回收站" onClick={() => deleteHistory(item)}><Trash size={15} /></button></div>)}</div>}{trashOpen && <RecycleBin items={modelTrash} onRestore={restoreHistory} onDelete={permanentlyDeleteHistory} />}</section>}
 
       {result && <section className="panel results-panel batch-results">
-        <div className="panel-heading"><div><h2>批量匹配结果</h2><p>已处理 {result.results.length} 个输入</p></div><button className="secondary-button" onClick={() => downloadResult()}><DownloadSimple size={16} />下载型号表</button></div>
+        <div className="panel-heading"><div><h2>批量匹配结果</h2><p>已处理 {result.results.length} 个输入{result.searchModeNote ? ` · ${result.searchModeNote}` : ""}</p></div><div className="result-heading-actions"><button className="secondary-button" onClick={() => downloadResult()}><DownloadSimple size={16} />下载型号表</button><button className="secondary-button" onClick={() => downloadUnmatched()} disabled={!result.results.some(isUnresolvedModelResult)}><DownloadSimple size={16} />下载未精准匹配</button><label className="secondary-button upload-inline"><UploadSimple size={16} />{supplementing ? "正在合并" : "上传补充表格"}<input type="file" accept=".xlsx,.xls,.csv" disabled={supplementing} onChange={(event) => { uploadModelSupplement(event.target.files?.[0]); event.target.value = ""; }} /></label></div></div>
         {result.results.map((item) => <div className="batch-result-block" key={item.query}>
           <div className="batch-result-title"><div><Badge tone="blue">查询输入</Badge><strong className="mono">{item.query}</strong>{item.preferenceReason && <small>{item.preferenceReason}</small>}</div><span>{item.local.length} 条本地匹配</span></div>
           {item.local.length ? <>
-            <div className="table-wrap"><table className="result-table"><thead><tr><th>内部型号</th><th>OE 号</th><th>UF 号</th><th>适用车型</th><th>来源</th><th>状态</th></tr></thead><tbody>{item.local.map((model) => { const codes = classifiedModelCodes(model); const matchedKind = /^UF/i.test(item.query) ? "UF号" : model.matchedKind; return <tr key={model.id} className={item.preferredModelId === model.id ? "selected" : ""}><td><strong className="mono">{model.internal}</strong><small>命中：{matchedKind}{item.preferredModelId === model.id && item.preferenceReason ? " · 系统优先" : ""}</small></td><td className="codes"><CodeValues values={codes.oeNos} webValues={codes.webOeNos} /></td><td className="codes"><CodeValues values={codes.ufNos} webValues={codes.webUfNos} /></td><td>{model.vehicle || "—"}</td><td><Badge tone={model.sourceType === "user_confirmed" ? "green" : "blue"} icon={model.sourceType === "user_confirmed" ? CheckCircle : BookOpenText}>{model.sourceType === "user_confirmed" ? "用户确认" : "原始匹配表"}</Badge></td><td><Status value="已确认" /></td></tr>; })}</tbody></table></div>
+            <div className="table-wrap"><table className="result-table"><thead><tr><th>内部型号</th><th>OE 号</th><th>UF 号</th><th>适用车型</th><th>适用车型（英文）</th><th>来源</th>{item.local.length > 1 && <th>外网产品图片</th>}<th>状态</th></tr></thead><tbody>{item.local.map((model, modelIndex) => { const codes = classifiedModelCodes(model); const matchedKind = /^UF/i.test(item.query) ? "UF号" : model.matchedKind; return <tr key={model.id} className={item.preferredModelId === model.id ? "selected" : ""}><td><strong className="mono">{model.internal}</strong><small>命中：{matchedKind}{item.preferredModelId === model.id && item.preferenceReason ? " · 系统优先" : ""}</small></td><td className="codes"><CodeValues values={codes.oeNos} webValues={codes.webOeNos} /></td><td className="codes"><CodeValues values={codes.ufNos} webValues={codes.webUfNos} /></td><td>{model.vehicle || "—"}</td><td>{model.vehicleEnglish || "—"}</td><td><Badge tone={model.sourceType === "user_confirmed" ? "green" : "blue"} icon={model.sourceType === "user_confirmed" ? CheckCircle : BookOpenText}>{model.sourceType === "user_confirmed" ? "用户确认" : "原始匹配表"}</Badge></td>{item.local.length > 1 && modelIndex === 0 && <td rowSpan={item.local.length}><ExternalImageCell images={item.productImages} alt={`${item.query} 外网产品图片`} /></td>}<td><Status value="已确认" /></td></tr>; })}</tbody></table></div>
             {item.local.length > 1 && !item.preferredModelId && <div className="manual-confirm"><span><strong>请选择正确的内部型号</strong><small>通用型号匹配结果不一致，确认后会同步更新知识库</small></span><select value={manualInputs[`candidate-${item.query}`] || ""} onChange={(event) => setManualInputs((values) => ({ ...values, [`candidate-${item.query}`]: event.target.value }))}><option value="">请选择内部型号</option>{item.local.map((model) => <option key={model.id} value={model.internal}>{model.internal}</option>)}</select><button className="primary-button" disabled={confirming === `candidate-${item.query}`} onClick={() => confirmExistingCandidate(item)}>{confirming === `candidate-${item.query}` ? <SpinnerGap className="spin" size={16} /> : <Check size={16} />}确认并入库</button></div>}
-          </> : <><EmptyState icon={GlobeHemisphereWest} title="本地知识库暂无记录" description="可在下方选择已有内部型号或填写新型号，确认后同步进入知识库。" /><div className="manual-confirm"><span><strong>手动确认内部型号</strong><small>可填写已有型号或创建新的内部型号</small></span><input value={manualInputs[item.query] || ""} onChange={(event) => setManualInputs((values) => ({ ...values, [item.query]: event.target.value }))} placeholder="例如 DQ910844" /><button className="primary-button" disabled={confirming === item.query} onClick={() => confirmUnmatched(item)}>{confirming === item.query ? <SpinnerGap className="spin" size={16} /> : <Check size={16} />}确认并入库</button></div></>}
+          </> : <><EmptyState icon={GlobeHemisphereWest} title="本地知识库暂无记录" description="可在下方选择已有内部型号或填写新型号，确认后同步进入知识库。" />{item.productImages?.length ? <div className="table-wrap external-match-table"><table className="result-table"><thead><tr><th>查询输入</th><th>外网产品图片</th><th>图片来源</th></tr></thead><tbody><tr><td className="mono">{item.query}</td><td><ExternalImageCell images={item.productImages} alt={`${item.query} 外网产品图片`} /></td><td>{[...new Set(item.productImages.map((image) => image.platform).filter(Boolean))].join(" / ") || "Google / Amazon / eBay"}</td></tr></tbody></table></div> : null}<div className="manual-confirm"><span><strong>手动确认内部型号</strong><small>可填写已有型号或创建新的内部型号</small></span><input value={manualInputs[item.query] || ""} onChange={(event) => setManualInputs((values) => ({ ...values, [item.query]: event.target.value }))} placeholder="例如 DQ910844" /><button className="primary-button" disabled={confirming === item.query} onClick={() => confirmUnmatched(item)}>{confirming === item.query ? <SpinnerGap className="spin" size={16} /> : <Check size={16} />}确认并入库</button></div></>}
+          {item.crossValidation?.length > 1 && <CrossValidation items={item.crossValidation} summary={item.crossValidationSummary} />}
           {item.webSupplement && <WebSupplement data={item.webSupplement} compact />}
         </div>)}
+        {result.results.some((item) => item.preferenceReason?.includes("用户") || item.preferenceReason?.includes("补充")) && <div className="supplement-edit-panel"><div className="panel-heading"><div><h3>已补充关系</h3><p>可直接二次编辑内部型号、OE 号和 UF 号</p></div></div>{result.results.filter((item) => item.preferenceReason?.includes("用户") || item.preferenceReason?.includes("补充")).map((item) => { const editing = editingModelQuery === item.query; const model = item.local.find((candidate) => candidate.id === item.preferredModelId) || item.local[0]; const codes = classifiedModelCodes(model); return <div className="supplement-edit-row" key={`edit-${item.query}`}><strong className="mono">{item.query}</strong>{editing ? <><input value={modelEditInputs.internal || ""} onChange={(event) => setModelEditInputs((values) => ({ ...values, internal: event.target.value }))} placeholder="内部型号" /><input value={modelEditInputs.oe || ""} onChange={(event) => setModelEditInputs((values) => ({ ...values, oe: event.target.value }))} placeholder="OE号，可多个" /><input value={modelEditInputs.uf || ""} onChange={(event) => setModelEditInputs((values) => ({ ...values, uf: event.target.value }))} placeholder="UF号，可多个" /><button className="primary-button" disabled={confirming === `edit-${item.query}`} onClick={() => saveModelEdit(item)}>{confirming === `edit-${item.query}` ? <SpinnerGap className="spin" size={15} /> : <Check size={15} />}保存</button><button className="secondary-button" onClick={() => setEditingModelQuery("")}>取消</button></> : <><span className="mono">{model?.internal || "—"} · {codes.oeNos.join(" / ") || "无 OE"} · {codes.ufNos.join(" / ") || "无 UF"}</span><button className="secondary-button" onClick={() => beginModelEdit(item)}><PencilSimpleLine size={15} />二次编辑</button></>}</div>; })}</div>}
       </section>}
     </div>
   );
+}
+
+function CrossValidation({ items = [], summary = {}, compact = false }) {
+  if (items.length < 2) return null;
+  const passed = summary.status === "通过";
+  return <div className={`cross-validation ${compact ? "cross-validation-compact" : ""}`}>
+    <div className="cross-validation-heading">
+      <div><strong>同单元格 OE 交叉验证</strong><small>{items.length} 个 OE 号分别查询后汇总</small></div>
+      <Badge tone={passed ? "green" : "warning"} icon={passed ? CheckCircle : WarningCircle}>{passed ? `通过 · ${summary.commonInternal || "同一内部型号"}` : "存在差异，需校对"}</Badge>
+    </div>
+    <div className="cross-validation-list">{items.map((item) => <div key={item.query}>
+      <span className="mono">{item.query}</span>
+      <span>{item.local?.length ? item.local.map((model) => model.internal).join(" / ") : "未匹配"}</span>
+      <Status value={item.local?.length ? "已匹配" : "未匹配"} />
+    </div>)}</div>
+  </div>;
 }
 
 function WebSupplement({ data, compact = false }) {
@@ -465,6 +613,7 @@ function QuotePage({ showToast, refreshOverview }) {
   const [history, setHistory] = useStoredState("hifly-quote-history", []);
   const [trash, setTrash] = useStoredState("hifly-history-trash", []);
   const [trashOpen, setTrashOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const textInquiryCount = useMemo(() => extractInquiryRows(normalizeTextInquiry(textInquiry)).length, [textInquiry]);
   const quoteTrash = useMemo(() => validTrashItems(trash).filter((item) => item.type === "quote"), [trash]);
   useEffect(() => { setTrash((items) => validTrashItems(items)); }, [setTrash]);
@@ -587,7 +736,7 @@ function QuotePage({ showToast, refreshOverview }) {
           <button className="primary-button wide" onClick={createQuote} disabled={(inputMode === "file" ? !file : !textInquiry.trim()) || loading}>{loading ? <><SpinnerGap className="spin" size={19} />{parseState.stage || "正在匹配并联网补充"}</> : <><FileMagnifyingGlass size={19} />生成报价预览</>}</button>
         </div>
       </section>
-      {(history.length > 0 || quoteTrash.length > 0) && <section className="panel compact-history"><div className="panel-heading"><div><h2>历史报价</h2><p>保存在当前浏览器，删除后在回收站保留 7 天</p></div><button className="secondary-button" onClick={() => setTrashOpen((value) => !value)}><Trash size={15} />回收站 {quoteTrash.length || ""}</button></div>{history.length > 0 && <div className="history-list">{history.map((item) => { const legacy = isLegacyMisdetectedQuote(item.data); return <div key={item.id}><button onClick={() => legacy ? showToast("这份旧记录误识别了序号列，请重新上传原表", "error") : setResult(item.data)}><ClockCounterClockwise size={17} /><span><strong>{item.data.filename}</strong><small>{legacy ? "旧版识别失效 · 请重新上传" : `${item.data.pricingLabel} · ${formatDate(item.createdAt)}`}</small></span></button>{!legacy && <a className="icon-button" href={`/api/quotes/${item.id}/export`} title="下载含图片的历史报价" aria-label={`下载 ${item.data.filename}`}><DownloadSimple size={16} /></a>}<button className="icon-button history-delete" title="移入回收站" aria-label={`删除 ${item.data.filename}`} onClick={() => deleteHistory(item)}><Trash size={16} /></button></div>; })}</div>}{trashOpen && <RecycleBin items={quoteTrash} onRestore={restoreHistory} onDelete={permanentlyDeleteHistory} />}</section>}
+      {(history.length > 0 || quoteTrash.length > 0) && <section className="panel compact-history"><div className="panel-heading"><div><h2>历史报价</h2><p>保存在当前浏览器，删除后在回收站保留 7 天</p></div><div className="history-heading-actions"><button className="secondary-button" onClick={() => setHistoryOpen((value) => !value)}><CaretDown className={historyOpen ? "rotated" : ""} size={15} />{historyOpen ? "收起记录" : `展开记录${history.length ? `（${history.length}）` : ""}`}</button><button className="secondary-button" onClick={() => setTrashOpen((value) => !value)}><Trash size={15} />回收站 {quoteTrash.length || ""}</button></div></div>{historyOpen && history.length > 0 && <div className="history-list">{history.map((item) => { const legacy = isLegacyMisdetectedQuote(item.data); return <div key={item.id}><button onClick={() => legacy ? showToast("这份旧记录误识别了序号列，请重新上传原表", "error") : setResult(item.data)}><ClockCounterClockwise size={17} /><span><strong>{item.data.filename}</strong><small>{legacy ? "旧版识别失效 · 请重新上传" : `${item.data.pricingLabel} · ${formatDate(item.createdAt)}`}</small></span></button>{!legacy && <a className="icon-button" href={`/api/quotes/${item.id}/export`} title="下载含图片的历史报价" aria-label={`下载 ${item.data.filename}`}><DownloadSimple size={16} /></a>}<button className="icon-button history-delete" title="移入回收站" aria-label={`删除 ${item.data.filename}`} onClick={() => deleteHistory(item)}><Trash size={16} /></button></div>; })}</div>}{trashOpen && <RecycleBin items={quoteTrash} onRestore={restoreHistory} onDelete={permanentlyDeleteHistory} />}</section>}
       {result && <QuoteResult result={result} onUpdate={updateResult} showToast={showToast} onKnowledgeUpdated={refreshOverview} />}
     </div>
   );
@@ -600,9 +749,18 @@ function QuoteImageCell({ src, status, alt, blankWhenEmpty = false }) {
   return <span className="muted">—</span>;
 }
 
+function ExternalImageCell({ images = [], alt = "外网产品图片" }) {
+  const items = (Array.isArray(images) ? images : []).filter((item) => item?.url).slice(0, 3);
+  if (!items.length) return <span className="muted">—</span>;
+  return <div className="external-image-cell">{items.map((item, index) => <a className="quote-image external-image" href={item.url} target="_blank" rel="noreferrer" title={`${item.platform || "外网"} · 点击查看大图`} key={`${item.url}-${index}`}><img src={item.url} alt={`${alt} ${index + 1}`} loading="lazy" referrerPolicy="no-referrer" /></a>)}</div>;
+}
+
 function QuoteResult({ result, onUpdate, showToast, onKnowledgeUpdated }) {
   const [selecting, setSelecting] = useState("");
   const [manualInputs, setManualInputs] = useState({});
+  const [supplementing, setSupplementing] = useState(false);
+  const [editingLine, setEditingLine] = useState(-1);
+  const [quoteEditInputs, setQuoteEditInputs] = useState({});
   const pricingLabels = quotePricingLabels(result);
   const selectCandidate = async (lineIndex, modelId) => {
     const key = `${lineIndex}-${modelId}`;
@@ -629,14 +787,61 @@ function QuoteResult({ result, onUpdate, showToast, onKnowledgeUpdated }) {
     } catch (error) { showToast(error.message, "error"); }
     finally { setSelecting(""); }
   };
+  const downloadUnmatched = () => {
+    const rows = result.lines.flatMap((line, lineIndex) => isUnresolvedQuoteLine(line) ? [{
+      报价行号: lineIndex + 1,
+      客户输入: line.input,
+      匹配内部型号: "",
+      候选内部型号: (line.candidateOptions || []).map((item) => item.internal).join(" / "),
+      补充OE号: String(line.oe || "").split(" / ").filter((value) => value && !/^UF/i.test(value)).join(" / "),
+      补充UF号: String(line.uf || "").split(" / ").filter((value) => /^UF/i.test(value)).join(" / "),
+      状态: line.candidateOptions?.length > 1 ? "多个匹配" : "未匹配或无价格",
+      异常说明: line.issue || "",
+    }] : []);
+    downloadXlsx(rows, `报价-未精准匹配-${new Date().toISOString().slice(0, 10)}.xlsx`, "待补充");
+  };
+  const uploadSupplement = async (file) => {
+    if (!file) return;
+    setSupplementing(true);
+    try {
+      const items = await parseSupplementRows(file, "quote");
+      const validItems = items.filter((item) => item.lineIndex >= 0 && item.lineIndex < result.lines.length);
+      if (!validItems.length) throw new Error("补充表中没有识别到有效的报价行号和匹配内部型号");
+      onUpdate(await api.supplementQuote(result.id, validItems));
+      onKnowledgeUpdated();
+      showToast(`已合并 ${validItems.length} 条报价补充关系，并写入知识库`);
+    } catch (error) { showToast(error.message, "error"); }
+    finally { setSupplementing(false); }
+  };
+  const beginQuoteEdit = (lineIndex) => {
+    const line = result.lines[lineIndex];
+    if (!line) return;
+    setEditingLine(lineIndex);
+    setQuoteEditInputs({ internal: line.internal || "", oe: line.oe || "", uf: line.uf || "" });
+  };
+  const saveQuoteEdit = async (lineIndex) => {
+    const targetInternal = String(quoteEditInputs.internal || "").trim();
+    if (!targetInternal) return showToast("请输入内部型号", "error");
+    setSelecting(`edit-${lineIndex}`);
+    try {
+      const oeNos = extractIdentifierTokens(quoteEditInputs.oe || "").filter((value) => !/^UF/i.test(value));
+      const ufNos = extractIdentifierTokens(quoteEditInputs.uf || "").filter((value) => /^UF/i.test(value));
+      onUpdate(await api.supplementQuote(result.id, [{ lineIndex, input: result.lines[lineIndex].input, targetInternal, oeNos, ufNos }]));
+      setEditingLine(-1);
+      onKnowledgeUpdated();
+      showToast("报价补充关系已更新");
+    } catch (error) { showToast(error.message, "error"); }
+    finally { setSelecting(""); }
+  };
   return (
     <section className="panel quote-result">
-      <div className="panel-heading"><div><Badge tone="green" icon={CheckCircle}>报价完成</Badge><h2>{result.filename}</h2><p>识别型号列：{result.detectedColumn} · 使用价格：{result.pricingLabel}</p></div><a className="primary-button download" href={`/api/quotes/${result.id}/export`}><DownloadSimple size={18} />下载含图片报价</a></div>
+      <div className="panel-heading"><div><Badge tone="green" icon={CheckCircle}>报价完成</Badge><h2>{result.filename}</h2><p>识别型号列：{result.detectedColumn} · 使用价格：{result.pricingLabel}</p></div><div className="result-heading-actions"><a className="primary-button download" href={`/api/quotes/${result.id}/export`}><DownloadSimple size={18} />下载含图片报价</a><button className="secondary-button" onClick={downloadUnmatched} disabled={!result.lines.some(isUnresolvedQuoteLine)}><DownloadSimple size={16} />下载未精准匹配</button><label className="secondary-button upload-inline"><UploadSimple size={16} />{supplementing ? "正在合并" : "上传补充表格"}<input type="file" accept=".xlsx,.xls,.csv" disabled={supplementing} onChange={(event) => { uploadSupplement(event.target.files?.[0]); event.target.value = ""; }} /></label></div></div>
       <div className="result-summary"><div><span>总行数</span><strong>{result.total}</strong></div><div><span>已匹配价格</span><strong className="green-text">{result.matched}</strong></div><div><span>待选内部型号</span><strong className="blue-text">{result.needsSelection || 0}</strong></div><div><span>待校对</span><strong className="orange-text">{result.needsReview}</strong></div><div><span>未匹配 / 无价格</span><strong className="red-text">{result.unmatched}</strong></div></div>
-      <div className="table-wrap"><table><thead><tr><th>客户输入</th><th>客户询价图片</th><th>内部型号</th><th>属性</th><th>产品目录图片</th><th>OE / UF</th>{pricingLabels.map((label) => <th key={label}>{label}</th>)}<th>型号来源</th><th>状态</th></tr></thead><tbody>{result.lines.slice(0, 60).map((line, index) => {
+      <div className="table-wrap"><table><thead><tr><th>客户输入</th><th>客户询价图片</th><th>内部型号</th><th>属性</th><th>产品目录图片</th><th>外网产品图片</th><th>OE / UF</th><th>适用车型</th><th>适用车型（英文）</th>{pricingLabels.map((label) => <th key={label}>{label}</th>)}<th>型号来源</th><th>状态</th></tr></thead><tbody>{result.lines.slice(0, 60).map((line, index) => {
         const needsManualConfirm = line.reviewStatus !== "已确认" && !line.selectedModelId && !(line.candidateOptions?.length > 1);
-        return <tr key={`${line.input}-${index}`}><td className="mono">{line.input || "—"}</td><td><QuoteImageCell src={line.customerImageValidated ? line.customerImage : ""} status={line.customerImageValidated ? line.customerImageStatus : ""} alt={`${line.input} 客户询价图片`} blankWhenEmpty /></td><td>{line.candidateOptions?.length > 1 && !line.selectedModelId ? <select className="candidate-select" value="" disabled={selecting.startsWith(`${index}-`)} onChange={(event) => selectCandidate(index, Number(event.target.value))}><option value="">请选择内部型号</option>{line.candidateOptions.map((option) => <option key={option.modelId} value={option.modelId}>{option.internal} · {quoteLinePrices(option, result).map((item) => item.price === null ? "—" : `¥${Number(item.price).toFixed(2)}`).join(" / ")}</option>)}</select> : needsManualConfirm ? <div className="manual-quote-confirm"><input value={manualInputs[index] || ""} onChange={(event) => setManualInputs((values) => ({ ...values, [index]: event.target.value }))} placeholder="填写已有或新内部型号" /><button disabled={selecting === `manual-${index}`} onClick={() => confirmLine(index)}>{selecting === `manual-${index}` ? <SpinnerGap className="spin" size={14} /> : <Check size={14} />}确认</button></div> : <strong className="mono">{line.internal || "—"}</strong>}<small>{line.selectionReason || (line.matchedKind ? `通过${line.matchedKind}命中` : line.vehicle)}</small></td><td>{line.attribute ? <Badge tone={line.attribute.includes("自制") ? "green" : "warning"}>{line.attribute}</Badge> : "—"}</td><td><QuoteImageCell src={line.catalogImage} alt={`${line.internal} 产品目录图片`} /></td><td className="codes">{line.oe || line.uf || "—"}</td>{quoteLinePrices(line, result).map((item, priceIndex) => <td className="price-cell" key={`${item.label || pricingLabels[priceIndex]}-${priceIndex}`} title={item.source || "暂无价格来源"}>{item.price === null ? "—" : `¥ ${Number(item.price).toFixed(2)}`}</td>)}<td><Badge tone={line.modelSource === "外网补充" ? "purple" : line.modelSource === "原始匹配表" ? "blue" : line.modelSource === "用户确认" ? "green" : "gray"}>{line.modelSource}</Badge></td><td>{line.reviewStatus === "待选择" ? <Status value="待选择" /> : line.issue ? <span className="issue" title={line.issue}><WarningCircle size={16} />需处理</span> : <Status value="已确认" />}</td></tr>;
+        return <tr key={`${line.input}-${index}`}><td className="mono">{line.input || "—"}{line.crossValidation?.length > 1 && <CrossValidation items={line.crossValidation} summary={line.crossValidationSummary} compact />}</td><td><QuoteImageCell src={line.customerImageValidated ? line.customerImage : ""} status={line.customerImageValidated ? line.customerImageStatus : ""} alt={`${line.input} 客户询价图片`} blankWhenEmpty /></td><td>{line.candidateOptions?.length > 1 && !line.selectedModelId ? <select className="candidate-select" value="" disabled={selecting.startsWith(`${index}-`)} onChange={(event) => selectCandidate(index, Number(event.target.value))}><option value="">请选择内部型号</option>{line.candidateOptions.map((option) => <option key={option.modelId} value={option.modelId}>{option.internal} · {quoteLinePrices(option, result).map((item) => item.price === null ? "—" : `¥${Number(item.price).toFixed(2)}`).join(" / ")}</option>)}</select> : needsManualConfirm ? <div className="manual-quote-confirm"><input value={manualInputs[index] || ""} onChange={(event) => setManualInputs((values) => ({ ...values, [index]: event.target.value }))} placeholder="填写已有或新内部型号" /><button disabled={selecting === `manual-${index}`} onClick={() => confirmLine(index)}>{selecting === `manual-${index}` ? <SpinnerGap className="spin" size={14} /> : <Check size={14} />}确认</button></div> : <strong className="mono">{line.internal || "—"}</strong>}<small>{line.selectionReason || (line.matchedKind ? `通过${line.matchedKind}命中` : line.vehicle)}</small></td><td>{line.attribute ? <Badge tone={line.attribute.includes("自制") ? "green" : "warning"}>{line.attribute}</Badge> : "—"}</td><td><QuoteImageCell src={line.catalogImage} alt={`${line.internal} 产品目录图片`} /></td><td><ExternalImageCell images={line.productImages} alt={`${line.input} 外网产品图片`} /></td><td className="codes">{line.oe || line.uf || "—"}</td><td>{line.vehicle || "—"}</td><td>{line.vehicleEnglish || "—"}</td>{quoteLinePrices(line, result).map((item, priceIndex) => <td className="price-cell" key={`${item.label || pricingLabels[priceIndex]}-${priceIndex}`} title={item.source || "暂无价格来源"}>{item.price === null ? "—" : `¥ ${Number(item.price).toFixed(2)}`}</td>)}<td><Badge tone={line.modelSource === "外网补充" ? "purple" : line.modelSource === "原始匹配表" ? "blue" : line.modelSource === "用户确认" ? "green" : "gray"}>{line.modelSource}</Badge></td><td>{line.reviewStatus === "待选择" ? <Status value="待选择" /> : line.issue ? <span className="issue" title={line.issue}><WarningCircle size={16} />需处理</span> : <Status value="已确认" />}</td></tr>;
       })}</tbody></table></div>
+      {result.lines.some((line) => line.supplemented || line.modelSource === "用户确认") && <div className="supplement-edit-panel quote-supplement-edit"><div className="panel-heading"><div><h3>已补充报价关系</h3><p>搜索结果中的补充型号支持二次编辑</p></div></div>{result.lines.map((line, index) => ({ line, index })).filter(({ line }) => line.supplemented || line.modelSource === "用户确认").map(({ line, index }) => editingLine === index ? <div className="supplement-edit-row" key={`quote-edit-${index}`}><strong className="mono">{line.input}</strong><input value={quoteEditInputs.internal || ""} onChange={(event) => setQuoteEditInputs((values) => ({ ...values, internal: event.target.value }))} placeholder="内部型号" /><input value={quoteEditInputs.oe || ""} onChange={(event) => setQuoteEditInputs((values) => ({ ...values, oe: event.target.value }))} placeholder="OE号，可多个" /><input value={quoteEditInputs.uf || ""} onChange={(event) => setQuoteEditInputs((values) => ({ ...values, uf: event.target.value }))} placeholder="UF号，可多个" /><button className="primary-button" disabled={selecting === `edit-${index}`} onClick={() => saveQuoteEdit(index)}>{selecting === `edit-${index}` ? <SpinnerGap className="spin" size={15} /> : <Check size={15} />}保存</button><button className="secondary-button" onClick={() => setEditingLine(-1)}>取消</button></div> : <div className="supplement-edit-row" key={`quote-edit-${index}`}><strong className="mono">{line.input}</strong><span className="mono">{line.internal || "—"} · {line.oe || "无 OE"} · {line.uf || "无 UF"}</span><button className="secondary-button" onClick={() => beginQuoteEdit(index)}><PencilSimpleLine size={15} />二次编辑</button></div>)}</div>}
     </section>
   );
 }
@@ -677,7 +882,7 @@ function ReviewsPage({ refreshKey, showToast, refreshOverview, onPendingCountCha
     <div className="content-stack">
       <section className="review-banner panel"><div><span className="review-banner-icon"><ShieldCheck size={27} weight="duotone" /></span><div><h2>外网结果与正式知识库严格隔离</h2><p>确认前只用于当前任务提示；确认后才会成为所有人可用的正式映射。</p></div></div><Badge tone="warning" icon={WarningCircle}>{pending.length} 条待处理</Badge></section>
       <section className="panel review-panel">
-        <div className="panel-heading"><div><h2>待校对队列</h2><p>建议优先处理高置信度且包含两个独立来源的候选</p></div><button className="secondary-button" onClick={load}><ArrowClockwise size={16} />刷新</button></div>
+        <div className="panel-heading"><div><h2>待校对队列</h2><p>建议优先处理高置信度且包含两个独立来源的候选</p></div><div className="review-heading-actions"><a className="secondary-button" href="/api/reviews/pending/export"><DownloadSimple size={16} />下载待校对队列</a><button className="secondary-button" onClick={load}><ArrowClockwise size={16} />刷新</button></div></div>
         {loading ? <div className="loading-block"><SpinnerGap className="spin" size={25} />正在读取校对队列</div> : pending.length ? <div className="review-list">{pending.map((item) => {
           const queryKind = /^UF/i.test(item.query) ? "UF号" : /^[A-Z]{1,4}\d/i.test(item.query) && !/-/.test(item.query) ? "查询型号" : "OE号";
           return <article className="review-card" key={item.id}>
@@ -724,18 +929,22 @@ function KnowledgePage({ showToast, refreshOverview }) {
     setLoading(false);
   };
   const readyEntries = entries.filter((entry) => entry.status === "ready" && entry.preview && entry.prepared);
-  const summary = readyEntries.reduce((total, entry) => ({ incoming: total.incoming + entry.preview.incoming, added: total.added + entry.preview.added, updated: total.updated + entry.preview.updated, conflicts: total.conflicts + entry.preview.conflicts }), { incoming: 0, added: 0, updated: 0, conflicts: 0 });
+  const summary = readyEntries.reduce((total, entry) => ({ incoming: total.incoming + entry.preview.incoming, added: total.added + entry.preview.added, supplemented: total.supplemented + (entry.preview.supplemented || 0), preserved: total.preserved + (entry.preview.preserved || 0) }), { incoming: 0, added: 0, supplemented: 0, preserved: 0 });
   const apply = async () => {
     if (!readyEntries.length) return;
     setLoading(true);
     try {
       const results = [];
-      for (const entry of readyEntries) {
+      const orderedEntries = type === "relations" ? [...readyEntries].sort((a, b) => {
+        const rank = (name) => /共有OE.*不一致|核验/.test(name) ? 0 : /双方合并|多型号/.test(name) ? 1 : 2;
+        return rank(a.file.name) - rank(b.file.name);
+      }) : readyEntries;
+      for (const entry of orderedEntries) {
         updateEntry(entry.id, { status: "importing", stage: "正在写入知识库" });
         results.push(await api.importKnowledge(entry.prepared, type));
         updateEntry(entry.id, { status: "imported", stage: "已导入" });
       }
-      showToast(`${results.length} 个文件已更新知识库`);
+      showToast(`${results.length} 个文件已作为补充导入，原有数据未覆盖`);
       setEntries([]);
       await loadVersions();
       refreshOverview();
@@ -748,16 +957,16 @@ function KnowledgePage({ showToast, refreshOverview }) {
     <div className="content-stack">
       <section className="knowledge-grid">
         <div className="panel update-panel">
-          <div className="panel-heading"><div><h2>更新源知识库</h2><p>上传后先解析差异，确认后才生成新版本</p></div><Badge tone="green" icon={ShieldCheck}>安全更新</Badge></div>
-          <div className="knowledge-tabs" role="tablist"><button role="tab" aria-selected={type === "models"} className={type === "models" ? "active" : ""} onClick={() => switchType("models")}><Tag size={18} />型号匹配表</button><button role="tab" aria-selected={type === "prices"} className={type === "prices" ? "active" : ""} onClick={() => switchType("prices")}><Database size={18} />价格表</button><button role="tab" aria-selected={type === "catalog"} className={type === "catalog" ? "active" : ""} onClick={() => switchType("catalog")}><FileMagnifyingGlass size={18} />产品目录</button></div>
-          <label className={`dropzone compact ${entries.length ? "has-file" : ""} ${dragging ? "is-dragging" : ""}`} role="button" tabIndex={0} aria-label="上传知识库文件" onKeyDown={(event) => { if (["Enter", " "].includes(event.key)) { event.preventDefault(); event.currentTarget.querySelector("input")?.click(); } }} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; setDragging(true); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); choose(event.dataTransfer.files); }}><input type="file" multiple accept=".xlsx,.xls,.csv,.txt,.pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg,text/plain,text/csv" onChange={(event) => { choose(event.target.files); event.target.value = ""; }} />{loading && !readyEntries.length ? <><SpinnerGap className="spin" size={28} /><strong>正在逐个解析 {entries.length} 个文件</strong><small>{type === "catalog" ? "正在读取目录内容并压缩可识别的产品图片" : "不会修改当前正式版本"}</small></> : entries.length ? <><span className="upload-icon success"><CheckCircle size={26} weight="fill" /></span><strong>已选择 {entries.length} 个文件</strong><small>{readyEntries.length} 个可导入 · {entries.filter((entry) => entry.status === "error").length} 个需处理</small><em>点击或拖拽重新选择</em></> : <><span className="upload-icon"><CloudArrowUp size={28} /></span><strong>{dragging ? "松开即可上传多个文件" : `上传新版${type === "models" ? "型号匹配表" : type === "catalog" ? "产品目录" : "价格表"}`}</strong><small>支持文字、Excel、PDF、PNG 和 JPG，可多选或批量拖拽</small><em>选择多个文件</em></>}</label>
+          <div className="panel-heading"><div><h2>补充源知识库</h2><p>上传后先解析差异，确认后只补充新内容，不覆盖已有数据</p></div><Badge tone="green" icon={ShieldCheck}>安全补充</Badge></div>
+          <div className="knowledge-tabs" role="tablist"><button role="tab" aria-selected={type === "models"} className={type === "models" ? "active" : ""} onClick={() => switchType("models")}><Tag size={18} />型号匹配表</button><button role="tab" aria-selected={type === "prices"} className={type === "prices" ? "active" : ""} onClick={() => switchType("prices")}><Database size={18} />价格表</button><button role="tab" aria-selected={type === "catalog"} className={type === "catalog" ? "active" : ""} onClick={() => switchType("catalog")}><FileMagnifyingGlass size={18} />产品目录</button><button role="tab" aria-selected={type === "relations"} className={type === "relations" ? "active" : ""} onClick={() => switchType("relations")}><PencilSimpleLine size={18} />关系核验</button></div>
+          <label className={`dropzone compact ${entries.length ? "has-file" : ""} ${dragging ? "is-dragging" : ""}`} role="button" tabIndex={0} aria-label="上传知识库文件" onKeyDown={(event) => { if (["Enter", " "].includes(event.key)) { event.preventDefault(); event.currentTarget.querySelector("input")?.click(); } }} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; setDragging(true); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); choose(event.dataTransfer.files); }}><input type="file" multiple accept={type === "relations" ? ".xlsx,.xls" : ".xlsx,.xls,.csv,.txt,.pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg,text/plain,text/csv"} onChange={(event) => { choose(event.target.files); event.target.value = ""; }} />{loading && !readyEntries.length ? <><SpinnerGap className="spin" size={28} /><strong>正在逐个解析 {entries.length} 个文件</strong><small>{type === "catalog" ? "正在读取目录内容并压缩可识别的产品图片" : type === "relations" ? "正在读取确认型号和备注，只预览不修改正式数据" : "只解析，不修改当前正式版本"}</small></> : entries.length ? <><span className="upload-icon success"><CheckCircle size={26} weight="fill" /></span><strong>已选择 {entries.length} 个文件</strong><small>{readyEntries.length} 个可导入 · {entries.filter((entry) => entry.status === "error").length} 个需处理</small><em>点击或拖拽重新选择</em></> : <><span className="upload-icon"><CloudArrowUp size={28} /></span><strong>{dragging ? "松开即可上传多个文件" : `补充新版${type === "models" ? "型号匹配表" : type === "catalog" ? "产品目录" : type === "relations" ? "关系核验表" : "价格表"}`}</strong><small>{type === "relations" ? "支持 Excel；优先处理确认型号和备注，无法确认的记录不会自动改绑" : "支持文字、Excel、PDF、PNG 和 JPG，可多选或批量拖拽"}</small><em>选择多个文件</em></>}</label>
           {entries.length > 0 && <div className="knowledge-file-list">{entries.map((entry) => <div key={entry.id} className={entry.status === "error" ? "has-error" : ""}><FileArrowUp size={17} /><span><strong>{entry.file.name}</strong><small>{entry.error || entry.stage || "等待解析"}</small></span>{entry.status === "parsing" || entry.status === "importing" ? <SpinnerGap className="spin" size={16} /> : entry.status === "error" ? <WarningCircle size={16} /> : <CheckCircle size={16} weight="fill" />}<button className="icon-button" title="移除文件" onClick={() => setEntries((items) => items.filter((item) => item.id !== entry.id))}><X size={14} /></button></div>)}</div>}
-          {readyEntries.length > 0 && <div className="diff-preview"><div className="diff-heading"><span><PencilSimpleLine size={18} /></span><div><strong>{readyEntries.length} 个文件差异预览</strong><small>确认后才会逐个写入共享知识库</small></div></div><div className="diff-grid"><div><span>文件记录</span><strong>{summary.incoming}</strong></div><div><span>新增</span><strong className="green-text">+{summary.added}</strong></div><div><span>更新</span><strong className="blue-text">{summary.updated}</strong></div><div><span>冲突</span><strong className="orange-text">{summary.conflicts}</strong></div></div><button className="primary-button wide" onClick={apply} disabled={loading}>{loading ? <><SpinnerGap className="spin" />正在写入</> : <><Check size={18} />确认导入 {readyEntries.length} 个文件</>}</button></div>}
+          {readyEntries.length > 0 && <div className="diff-preview"><div className="diff-heading"><span><PencilSimpleLine size={18} /></span><div><strong>{readyEntries.length} 个文件补充预览</strong><small>确认后只补充新内容，已有记录会原样保留</small></div></div><div className="diff-grid"><div><span>文件记录</span><strong>{summary.incoming}</strong></div><div><span>新增</span><strong className="green-text">+{summary.added}</strong></div><div><span>待补充</span><strong className="blue-text">{summary.supplemented}</strong></div><div><span>原有保留</span><strong className="orange-text">{summary.preserved}</strong></div></div><button className="primary-button wide" onClick={apply} disabled={loading}>{loading ? <><SpinnerGap className="spin" />正在写入</> : <><Check size={18} />确认补充 {readyEntries.length} 个文件</>}</button></div>}
         </div>
         <div className="panel rules-panel">
-          <div className="panel-heading"><div><h2>更新规则</h2><p>多人使用时避免误覆盖正式数据</p></div></div>
-          <ol><li><span>1</span><div><strong>自动识别结构</strong><small>识别型号、OE、UF、价格列及产品目录图片</small></div></li><li><span>2</span><div><strong>先看差异</strong><small>新增、更新与冲突清晰分开，不直接覆盖</small></div></li><li><span>3</span><div><strong>保留版本</strong><small>每次更新记录文件、时间和操作者</small></div></li></ol>
-          <div className="inline-alert info"><ShieldCheck size={20} /><span><strong>外网数据不会随文件更新混入</strong><small>仍需在“二次校对”页面单独确认。</small></span></div>
+          <div className="panel-heading"><div><h2>补充规则</h2><p>多人使用时避免误覆盖正式数据</p></div></div>
+          <ol><li><span>1</span><div><strong>自动识别结构</strong><small>识别型号、OE、UF、价格列及产品目录图片</small></div></li><li><span>2</span><div><strong>先看差异</strong><small>新增、待补充与原有记录清晰分开，不覆盖已有数据</small></div></li><li><span>3</span><div><strong>保留版本</strong><small>每次补充记录文件、时间和操作者</small></div></li></ol>
+          <div className="inline-alert info"><ShieldCheck size={20} /><span><strong>{type === "relations" ? "关系核验以表格确认结果为准" : "新文件只作补充，不会覆盖已有数据"}</strong><small>{type === "relations" ? "会读取确认型号和备注；备注写明无法确认/无法查询的记录保留现状，找不到现有内部型号的代码列入冲突。" : "相同价格保留原值；型号、目录只补充缺失信息。外网数据仍需在“二次校对”页面单独确认。"}</small></span></div>
         </div>
       </section>
       <section className="panel versions-panel"><div className="panel-heading"><div><h2>知识库版本</h2><p>当前共保留 {versions.length} 条更新记录，下载内容为最新生效版本</p></div><div className="version-actions"><a className="secondary-button" href="/api/knowledge/export?type=models"><DownloadSimple size={16} />下载大厂型号匹配</a><a className="secondary-button" href="/api/knowledge/export?type=prices"><DownloadSimple size={16} />下载价格库</a><a className="secondary-button" href="/api/knowledge/export?type=catalog"><DownloadSimple size={16} />下载产品目录</a><button className="secondary-button" onClick={loadVersions}><ClockCounterClockwise size={16} />刷新记录</button></div></div><div className="table-wrap"><table><thead><tr><th>数据类型</th><th>版本</th><th>源文件</th><th>记录数</th><th>操作人</th><th>更新时间</th><th>状态</th></tr></thead><tbody>{versions.map((item) => <tr key={item.id}><td><strong>{item.type}</strong></td><td className="mono">{item.version}</td><td>{item.filename}</td><td>{item.summary?.total || item.summary?.added || "—"}</td><td>{item.operator}</td><td>{formatDate(item.created_at)}</td><td><Status value="已确认" /></td></tr>)}</tbody></table></div></section>

@@ -7,15 +7,20 @@ async function parseResponse(response) {
 export const api = {
   overview: () => fetch("/api/overview", { cache: "no-store" }).then(parseResponse),
   searchModels: (query) => fetch(`/api/models/search?q=${encodeURIComponent(query)}`).then(parseResponse),
-  searchModelsBatch: (queries) => fetch("/api/models/search/batch", {
+  searchModelsBatch: (queries, options = {}) => fetch("/api/models/search/batch", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ queries }),
+    body: JSON.stringify({ queries, ...options }),
   }).then(parseResponse),
-  confirmMapping: (input, targetInternal, context) => fetch("/api/mappings/confirm", {
+  confirmMapping: (input, targetInternal, context, extras = {}) => fetch("/api/mappings/confirm", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ input, targetInternal, context, reviewer: "当前用户" }),
+    body: JSON.stringify({ input, targetInternal, context, reviewer: "当前用户", oeNos: extras.oeNos || [], ufNos: extras.ufNos || [] }),
+  }).then(parseResponse),
+  confirmMappingsBatch: (items, context = "型号查询") => fetch("/api/mappings/confirm-batch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ items, context, reviewer: "当前用户" }),
   }).then(parseResponse),
   reviews: () => fetch("/api/reviews", { cache: "no-store" }).then(parseResponse),
   review: (id, action, reviewer = "当前用户", targetInternal = "", selectedOeNos = [], selectedUfNos = []) => fetch(`/api/reviews/${id}`, {
@@ -37,6 +42,11 @@ export const api = {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ lineIndex, targetInternal, reviewer: "当前用户" }),
+  }).then(parseResponse),
+  supplementQuote: (jobId, items) => fetch(`/api/quotes/${jobId}/supplement`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ items, reviewer: "当前用户" }),
   }).then(parseResponse),
   attachQuoteImages: (jobId, images) => fetch(`/api/quotes/${jobId}/images`, {
     method: "POST",

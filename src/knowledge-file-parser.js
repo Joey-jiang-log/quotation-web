@@ -105,6 +105,10 @@ export async function prepareKnowledgeFile(file, type, onProgress) {
     if (!records.length) throw new Error("没有识别到以 DQ 开头的产品目录型号");
     return catalogJsonFile(records, file);
   }
+  if (type === "relations") {
+    if (!["xlsx", "xls"].includes(extensionOf(file.name))) throw new Error("关系核验表仅支持 Excel 文件");
+    return file;
+  }
   if (["xlsx", "xls"].includes(extensionOf(file.name))) return file;
   const text = await extractTextFromFile(file, onProgress);
   if (type === "models") {
