@@ -4,11 +4,14 @@ import {
   searchModels,
   searchModelsBatch,
   confirmUserMapping,
+  confirmMappingsBatch,
   listReviews,
   reviewCandidate,
+  exportPendingReviews,
   previewQuote,
   selectQuoteCandidate,
   confirmQuoteLine,
+  supplementQuoteJob,
   attachQuoteImages,
   exportQuote,
   previewKnowledgeImport,
@@ -70,11 +73,15 @@ export default async function handler(req, res) {
     }
     if (req.method === "POST" && pathname === "/api/models/search/batch") {
       const payload = JSON.parse((await readBody(req)).toString("utf8") || "{}");
-      return sendJson(res, 200, await searchModelsBatch(payload.queries));
+      return sendJson(res, 200, await searchModelsBatch(payload.queries, { includeWeb: payload.includeWeb !== false }));
     }
     if (req.method === "POST" && pathname === "/api/mappings/confirm") {
       const payload = JSON.parse((await readBody(req)).toString("utf8") || "{}");
-      return sendJson(res, 200, confirmUserMapping(payload.input, payload.targetInternal, payload.context, payload.reviewer));
+      return sendJson(res, 200, confirmUserMapping(payload.input, payload.targetInternal, payload.context, payload.reviewer, { oeNos: payload.oeNos, ufNos: payload.ufNos }));
+    }
+    if (req.method === "POST" && pathname === "/api/mappings/confirm-batch") {
+      const payload = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      return sendJson(res, 200, confirmMappingsBatch(payload.items, payload.context, payload.reviewer));
     }
     if (req.method === "GET" && pathname === "/api/reviews") return sendJson(res, 200, listReviews());
     if (req.method === "GET" && pathname === "/api/reviews/export") {
@@ -83,6 +90,13 @@ export default async function handler(req, res) {
       res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent("二次校对确认记录.xlsx")}`);
       res.setHeader("Cache-Control", "no-store");
       return res.end(exportConfirmedReviews());
+    }
+    if (req.method === "GET" && pathname === "/api/reviews/pending/export") {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent("待校对队列.xlsx")}`);
+      res.setHeader("Cache-Control", "no-store");
+      return res.end(exportPendingReviews());
     }
     const reviewMatch = pathname.match(/^\/api\/reviews\/(\d+)$/);
     if (req.method === "POST" && reviewMatch) {
@@ -109,6 +123,11 @@ export default async function handler(req, res) {
       const payload = JSON.parse((await readBody(req)).toString("utf8") || "{}");
       return sendJson(res, 200, confirmQuoteLine(quoteConfirmMatch[1], payload.lineIndex, payload.targetInternal, payload.reviewer));
     }
+    const quoteSupplementMatch = pathname.match(/^\/api\/quotes\/([\w-]+)\/supplement$/);
+    if (req.method === "POST" && quoteSupplementMatch) {
+      const payload = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      return sendJson(res, 200, supplementQuoteJob(quoteSupplementMatch[1], payload.items, payload.reviewer));
+    }
     const quoteImagesMatch = pathname.match(/^\/api\/quotes\/([\w-]+)\/images$/);
     if (req.method === "POST" && quoteImagesMatch) {
       const payload = JSON.parse((await readBody(req)).toString("utf8") || "{}");
@@ -124,7 +143,7 @@ export default async function handler(req, res) {
     }
     if (req.method === "POST" && pathname === "/api/knowledge/preview") {
       const requestedType = url.searchParams.get("type");
-      const type = ["models", "prices", "catalog"].includes(requestedType) ? requestedType : "models";
+      const type = ["models", "prices", "catalog", "relations"].includes(requestedType) ? requestedType : "models";
       return sendJson(res, 200, previewKnowledgeImport(await readBody(req), fileName(req, "知识库.xlsx"), type));
     }
     if (req.method === "POST" && pathname === "/api/knowledge/apply") {
@@ -133,7 +152,7 @@ export default async function handler(req, res) {
     }
     if (req.method === "POST" && pathname === "/api/knowledge/import") {
       const requestedType = url.searchParams.get("type");
-      const type = ["models", "prices", "catalog"].includes(requestedType) ? requestedType : "models";
+      const type = ["models", "prices", "catalog", "relations"].includes(requestedType) ? requestedType : "models";
       return sendJson(res, 200, applyKnowledgeFile(await readBody(req), fileName(req, "知识库.xlsx"), type, req.headers["x-operator"] || "当前用户"));
     }
     if (req.method === "GET" && pathname === "/api/versions") return sendJson(res, 200, listVersions());

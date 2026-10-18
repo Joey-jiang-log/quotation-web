@@ -65,6 +65,34 @@ function compactEvidenceText(value = "", maxLength = 520) {
   return clean.length > maxLength ? `${clean.slice(0, maxLength).trim()}…` : clean;
 }
 
+function isProductImageUrl(value = "") {
+  try {
+    const url = new URL(value);
+    if (!/^https?:$/i.test(url.protocol)) return false;
+    const source = `${url.hostname}${url.pathname}${url.search}`.toLowerCase();
+    if (/favicon|logo|sprite|google\.com\/search|googleadservices/.test(source)) return false;
+    return /\.(?:jpe?g|png|webp)(?:$|[?#])/.test(source)
+      || /(?:images?|thumbnail|media|product|photo|mug|s-l\d+)/.test(source)
+      || /(?:googleusercontent|gstatic)\./.test(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function extractImageUrls(value = "") {
+  const source = String(value || "")
+    .replace(/\\u002F/g, "/")
+    .replace(/\\\//g, "/");
+  const candidates = [
+    ...[...source.matchAll(/!\[[^\]]*\]\((https?:\/\/[^)\s]+)/gi)].map((match) => match[1]),
+    ...[...source.matchAll(/(?:image|thumbnail|original|image_url|imageUrl)[^\"']{0,80}[\"'](https?:\/\/[^\"']+)/gi)].map((match) => match[1]),
+    ...[...source.matchAll(/https?:\/\/[^\s\"'<>\\)]+/gi)].map((match) => match[0]),
+  ];
+  return unique(candidates.map((value) => {
+    try { return decodeURIComponent(value).replace(/[&quot;]+$/g, ""); } catch { return value; }
+  }).filter(isProductImageUrl)).slice(0, 6);
+}
+
 function extractCandidates(text = "") {
   const cleanText = text.replace(/https?:\/\/\S+/gi, " ").replace(/%[0-9A-F]{2}/gi, " ");
   const ufNos = unique((cleanText.match(/\bUF[-\s]?(?=[A-Z0-9]{2,8}\b)(?=[A-Z0-9]*\d)[A-Z0-9]{2,8}\b/gi) || []).map((value) => value.replace(/\s+/g, "").toUpperCase()));
@@ -106,6 +134,7 @@ async function braveSearch(searchText) {
     title: item.title || "外网搜索结果",
     url: item.url,
     snippet: decodeHtml(item.description || ""),
+    imageUrls: extractImageUrls(JSON.stringify(item)),
     provider: "Brave Search",
   }));
 }
@@ -122,6 +151,7 @@ async function duckDuckGoSearch(searchText) {
       title: decodeHtml(match[2]),
       url: unwrapDuckDuckGoUrl(match[1]),
       snippet: decodeHtml(match[3] || match[4] || ""),
+      imageUrls: extractImageUrls(html),
       provider: "DuckDuckGo",
     });
   }
@@ -132,6 +162,7 @@ async function duckDuckGoSearch(searchText) {
         title: decodeHtml(match[2]),
         url: unwrapDuckDuckGoUrl(match[1]),
         snippet: "",
+        imageUrls: extractImageUrls(html),
         provider: "DuckDuckGo",
       });
     }
@@ -145,7 +176,7 @@ async function googleSearch(searchText) {
   if (reader.ok) {
     const text = await reader.text();
     const blocked = /Target URL returned error|Error Page|unusual traffic|CAPTCHA|not a robot|automated queries/i.test(text);
-    if (text.trim() && !blocked) return [{ title: `Google：${searchText}`, url: target.replace("http://", "https://"), snippet: text.slice(0, 30000), provider: "Google", platform: "Google" }];
+    if (text.trim() && !blocked) return [{ title: `Google：${searchText}`, url: target.replace("http://", "https://"), snippet: text.slice(0, 30000), imageUrls: extractImageUrls(text), provider: "Google", platform: "Google" }];
   }
   const response = await fetchWithTimeout(target.replace("http://", "https://"));
   if (!response.ok) throw new Error(`Google 返回 ${response.status}`);
@@ -156,12 +187,25 @@ async function googleSearch(searchText) {
   while ((match = regex.exec(html)) && results.length < 6) {
     const url = decodeURIComponent(match[1]);
     if (!/^https?:/i.test(url)) continue;
-    results.push({ title: decodeHtml(match[2]), url, snippet: "", provider: "Google", platform: "Google" });
+    results.push({ title: decodeHtml(match[2]), url, snippet: "", imageUrls: extractImageUrls(html), provider: "Google", platform: "Google" });
   }
   if (results.length) return results;
   // Google 直连在部分云环境不返回正文时，使用公开网页索引补足结果条目，仍按 Google 校对通道展示。
   const fallback = await duckDuckGoSearch(searchText);
   return fallback.map((item) => ({ ...item, provider: "Google fallback index", platform: "Google" }));
+}
+
+async function googleImageSearch(searchText) {
+  const target = `https://www.google.com/search?tbm=isch&hl=en&q=${encodeURIComponent(searchText)}`;
+  try {
+    const response = await fetchWithTimeout(target, {}, 8500);
+    if (!response.ok) return [];
+    const html = await response.text();
+    const imageUrls = extractImageUrls(html);
+    return imageUrls.length ? [{ title: `Google 图片：${searchText}`, url: target, snippet: "", imageUrls, provider: "Google Images", platform: "Google" }] : [];
+  } catch {
+    return [];
+  }
 }
 
 async function amazonSearch(searchText) {
@@ -170,7 +214,7 @@ async function amazonSearch(searchText) {
     const reader = await fetchWithTimeout(`https://r.jina.ai/${target}`, {}, 8500);
     if (reader.ok) {
       const text = await reader.text();
-      if (text.trim() && !/Target URL returned error|Error Page/i.test(text)) return [{ title: `Amazon：${searchText}`, url: target.replace("http://", "https://"), snippet: text.slice(0, 30000), provider: "Amazon", platform: "Amazon" }];
+      if (text.trim() && !/Target URL returned error|Error Page/i.test(text)) return [{ title: `Amazon：${searchText}`, url: target.replace("http://", "https://"), snippet: text.slice(0, 30000), imageUrls: extractImageUrls(text), provider: "Amazon", platform: "Amazon" }];
     }
   } catch { /* 继续使用站内索引搜索 */ }
   const fallback = await duckDuckGoSearch(`site:amazon.com ${searchText}`);
@@ -183,7 +227,7 @@ async function ebaySearch(searchText) {
     const reader = await fetchWithTimeout(`https://r.jina.ai/${target}`, {}, 8500);
     if (reader.ok) {
       const text = await reader.text();
-      if (text.trim() && !/Target URL returned error|Error Page|SOMETHING WENT WRONG/i.test(text)) return [{ title: `eBay：${searchText}`, url: target.replace("http://", "https://"), snippet: text.slice(0, 30000), provider: "eBay", platform: "eBay" }];
+      if (text.trim() && !/Target URL returned error|Error Page|SOMETHING WENT WRONG/i.test(text)) return [{ title: `eBay：${searchText}`, url: target.replace("http://", "https://"), snippet: text.slice(0, 30000), imageUrls: extractImageUrls(text), provider: "eBay", platform: "eBay" }];
     }
   } catch { /* 继续使用站内索引搜索 */ }
   const fallback = await duckDuckGoSearch(`site:ebay.com ${searchText}`);
@@ -255,7 +299,7 @@ export async function searchExternalModels(query, context = {}) {
   const ufSearchTexts = unique([context.internal, query, primaryOe])
     .slice(0, 3)
     .map((anchor) => `"${anchor}" ignition coil "UF" cross reference`);
-  const [platformResults, catalogResults] = await Promise.all([
+  const [platformResults, catalogResults, googleImages] = await Promise.all([
     Promise.all([
       searchPlatform("Google", searchText),
       ...ufSearchTexts.map((text) => searchPlatform("Google", text)),
@@ -263,8 +307,9 @@ export async function searchExternalModels(query, context = {}) {
       searchPlatform("eBay", marketplaceText),
     ]),
     catalogCrossReferenceSearch(query, context),
+    googleImageSearch(searchText),
   ]);
-  let results = [...platformResults.flatMap((item) => item.results), ...catalogResults];
+  let results = [...platformResults.flatMap((item) => item.results), ...catalogResults, ...googleImages];
   if (!results.length) {
     try {
       const fallback = await braveSearch(searchText);
@@ -308,6 +353,12 @@ export async function searchExternalModels(query, context = {}) {
   const oeEvidence = flatten(support.oe).filter(keepCandidate);
   const ufEvidence = flatten(support.uf).filter(keepCandidate).slice(0, 2);
   const activePlatforms = unique(results.map((item) => item.platform || item.provider));
+  const productImages = [...new Map(deduped.flatMap((item) => (item.imageUrls || []).map((url) => [url, {
+    url,
+    platform: item.platform || item.provider || "Web",
+    sourceUrl: item.url,
+    title: item.title || "外网产品图片",
+  }])).values())].slice(0, 9);
   const verifiedCount = [...oeEvidence, ...ufEvidence].filter((item) => item.verified).length;
   const confidence = verifiedCount ? 88 : activePlatforms.length >= 2 && (oeEvidence.length || ufEvidence.length) ? 68 : activePlatforms.length ? 48 : 0;
   return {
@@ -322,6 +373,7 @@ export async function searchExternalModels(query, context = {}) {
     verifiedUfNos: ufEvidence.filter((item) => item.verified).map((item) => item.value),
     candidateEvidence: { oe: oeEvidence, uf: ufEvidence },
     platforms: activePlatforms,
+    productImages,
     platformErrors: Object.fromEntries(platformResults.filter((item) => item.error).map((item) => [item.platform, item.error])),
     evidence,
     confidence,
