@@ -70,14 +70,14 @@ test("emits the files required by Sites packaging", async () => {
 });
 
 test("red-shell catalog variants use standard internal code for quote output", () => {
-  const red = { commonName: "丰田凯美瑞（红色）", vehicle: "丰田凯美瑞（红色）" };
+  const red = { internal: "DQ91084812", commonName: "丰田凯美瑞（红色）", vehicle: "丰田凯美瑞（红色）" };
   const catalog = JSON.parse(readFileSync(new URL("../data/source/产品目录60625.json", import.meta.url), "utf8")).records;
   const realVariant = catalog.find((item) => item.internal === "DQ91084812");
   assert.ok(realVariant, "the red variant exists in the source catalog");
   assert.equal(normalizeRedShellInternal("DQ91084812", realVariant), "DQ910848");
   assert.equal(normalizeRedShellInternal("DQ91084812", red), "DQ910848");
   assert.equal(normalizeRedShellInternal("DQ910848", red), "DQ910848");
-  assert.equal(normalizeRedShellInternal("DQ91084812", { commonName: "丰田凯美瑞" }), "DQ91084812");
+  assert.equal(normalizeRedShellInternal("DQ91084812", { internal: "DQ91084812", commonName: "丰田凯美瑞" }), "DQ91084812");
   assert.equal(normalizeRedShellInternal("DQ91084812", null), "DQ91084812");
-  assert.equal(normalizeRedShellInternal("DQ9101AR", { commonName: "红色外壳" }), "DQ9101AR");
+  assert.equal(normalizeRedShellInternal("DQ9101AR", { internal: "DQ9101AR", commonName: "红色外壳" }), "DQ9101AR");
 });
