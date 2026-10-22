@@ -8,6 +8,7 @@ import { neon } from "@neondatabase/serverless";
 import XLSX from "xlsx";
 import ExcelJS from "exceljs";
 import { searchExternalModels } from "./search.mjs";
+import { normalizeRedShellInternal } from "./red-shell.mjs";
 
 const SEARCH_PROVIDER_PREFIX = "Google UF 专项校对 v5";
 const MAX_BATCH_MODEL_QUERIES = 500;
@@ -760,8 +761,9 @@ function serializeModel(row, matchedKind = "") {
   const rawUfNos = json(row.uf_nos);
   const rawWebOeNos = json(row.web_oe_nos);
   const rawWebUfNos = json(row.web_uf_nos);
+  const displayInternal = normalizeRedShellInternal(row.internal, catalogForInternal(row.internal));
   return {
-    id: row.id, internal: row.internal, productCodes: json(row.product_codes), oldModels: json(row.old_models),
+    id: row.id, internal: row.internal, displayInternal, redShellAdjusted: displayInternal !== row.internal, productCodes: json(row.product_codes), oldModels: json(row.old_models),
     oeNos: rawOeNos.filter((item) => !/^UF/i.test(String(item).trim())),
     ufNos: unique([...rawUfNos, ...rawOeNos.filter((item) => /^UF/i.test(String(item).trim()))]), vehicle: row.vehicle, category: row.category,
     vehicleEnglish: vehicleToEnglish(row.vehicle),
@@ -1459,10 +1461,11 @@ async function mapQuoteLine(input, original, pricings) {
     : resolveOeCandidates(found);
   const local = resolution.candidates;
   const candidateOptions = local.map((model) => {
-    const prices = pricesForInternal(model.internal, pricings);
     const catalog = catalogForInternal(model.internal);
+    const displayInternal = normalizeRedShellInternal(model.internal, catalog);
+    const prices = pricesForInternal(displayInternal, pricings);
     return {
-      modelId: model.id, internal: model.internal, oe: model.oeNos.join(" / "), uf: model.ufNos.join(" / "), vehicle: model.vehicle, vehicleEnglish: vehicleToEnglish(model.vehicle),
+      modelId: model.id, internal: displayInternal, matchedOriginalInternal: displayInternal !== model.internal ? model.internal : "", redShellAdjusted: displayInternal !== model.internal, oe: model.oeNos.join(" / "), uf: model.ufNos.join(" / "), vehicle: model.vehicle, vehicleEnglish: vehicleToEnglish(model.vehicle),
       matchedKind: model.matchedKind, prices, price: prices[0]?.price ?? null, priceSource: prices[0]?.source || "",
       attribute: attributeFromPrices(prices),
       catalogImage: catalog?.image || "", catalogName: catalog?.commonName || "", catalogSource: catalog?.sourceSheet || "",
@@ -1477,7 +1480,7 @@ async function mapQuoteLine(input, original, pricings) {
     return {
       original, input, internal: selected.internal, oe: selected.oe, uf: selected.uf, vehicle: selected.vehicle, vehicleEnglish: selected.vehicleEnglish, attribute: selected.attribute, prices: selected.prices, price: selected.price,
       catalogImage: selected.catalogImage, catalogName: selected.catalogName, catalogSource: selected.catalogSource,
-      priceSource: selected.priceSource, modelSource: selected.modelSource, reviewStatus: "已确认", selectedModelId: selected.modelId,
+      priceSource: selected.priceSource, modelSource: selected.modelSource, matchedOriginalInternal: selected.matchedOriginalInternal || "", redShellAdjusted: Boolean(selected.redShellAdjusted), reviewStatus: "已确认", selectedModelId: selected.modelId,
       matchedKind: selected.matchedKind, candidateOptions, selectionReason: resolution.reason,
       ...validationFields,
       issue: missingPriceIssue(selected.prices),
@@ -1494,7 +1497,7 @@ async function mapQuoteLine(input, original, pricings) {
     return {
       original, input, internal: selected.internal, oe: selected.oe, uf: selected.uf, vehicle: selected.vehicle, vehicleEnglish: selected.vehicleEnglish, attribute: selected.attribute, prices: selected.prices, price: selected.price,
       catalogImage: selected.catalogImage, catalogName: selected.catalogName, catalogSource: selected.catalogSource,
-      priceSource: selected.priceSource, modelSource: selected.modelSource, reviewStatus: "已确认", selectedModelId: selected.modelId,
+      priceSource: selected.priceSource, modelSource: selected.modelSource, matchedOriginalInternal: selected.matchedOriginalInternal || "", redShellAdjusted: Boolean(selected.redShellAdjusted), reviewStatus: "已确认", selectedModelId: selected.modelId,
       matchedKind: selected.matchedKind, candidateOptions, ...validationFields, issue: missingPriceIssue(selected.prices),
     };
   }
@@ -1570,7 +1573,7 @@ export function selectQuoteCandidate(id, lineIndex, modelId) {
   Object.assign(line, {
     internal: selected.internal, oe: selected.oe, uf: selected.uf, vehicle: selected.vehicle, vehicleEnglish: selected.vehicleEnglish, attribute: selected.attribute || attributeFromPrices(selected.prices), prices: selected.prices || [], price: selected.price,
     catalogImage: selected.catalogImage || "", catalogName: selected.catalogName || "", catalogSource: selected.catalogSource || "",
-    priceSource: selected.priceSource, modelSource: selected.modelSource, selectedModelId: selected.modelId,
+    priceSource: selected.priceSource, modelSource: selected.modelSource, selectedModelId: selected.modelId, matchedOriginalInternal: selected.matchedOriginalInternal || "", redShellAdjusted: Boolean(selected.redShellAdjusted),
     matchedKind: selected.matchedKind, reviewStatus: "已确认", issue: missingPriceIssue(selected.prices || [], "所选内部型号"),
   });
   confirmUserMapping(line.input, selected.internal, "报价", "当前用户");
@@ -1586,41 +1589,22 @@ export function confirmQuoteLine(id, lineIndex, targetInternal, reviewer = "当�
   const line = result.lines?.[Number(lineIndex)];
   if (!line) throw new Error("报价行不存在");
   const confirmation = confirmUserMapping(line.input, targetInternal, "报价", reviewer);
-  const model = confirmation.model;
   const pricings = normalizePricings(result.pricings || result.pricing || {});
-  const prices = pricesForInternal(model.internal, pricings);
-  const catalog = catalogForInternal(model.internal);
-  Object.assign(line, {
-    internal: model.internal,
-    oe: model.oeNos.join(" / "),
-    uf: model.ufNos.join(" / "),
-    vehicle: model.vehicle,
-    vehicleEnglish: model.vehicleEnglish || vehicleToEnglish(model.vehicle),
-    attribute: attributeFromPrices(prices),
-    prices,
-    price: prices[0]?.price ?? null,
-    priceSource: prices[0]?.source || "",
-    catalogImage: catalog?.image || "",
-    catalogName: catalog?.commonName || "",
-    catalogSource: catalog?.sourceSheet || "",
-    modelSource: "用户确认",
-    selectedModelId: model.id,
-    matchedKind: "用户确认",
-    reviewStatus: "已确认",
-    candidateOptions: [],
-    supplemented: true,
-    issue: missingPriceIssue(prices, "已确认内部型号"),
-  });
+  applyConfirmedQuoteModel(line, confirmation.model, pricings, "用户确认");
+  line.selectionReason = "用户手动修改并确认";
   refreshQuoteMetrics(result);
   db.prepare("UPDATE quote_jobs SET result_json=? WHERE id=?").run(JSON.stringify(result), id);
   return result;
 }
 
 function applyConfirmedQuoteModel(line, model, pricings, matchedKind = "补充导入") {
-  const prices = pricesForInternal(model.internal, pricings);
   const catalog = catalogForInternal(model.internal);
+  const displayInternal = normalizeRedShellInternal(model.internal, catalog);
+  const prices = pricesForInternal(displayInternal, pricings);
   Object.assign(line, {
-    internal: model.internal,
+    internal: displayInternal,
+    matchedOriginalInternal: displayInternal !== model.internal ? model.internal : "",
+    redShellAdjusted: displayInternal !== model.internal,
     oe: model.oeNos.join(" / "),
     uf: model.ufNos.join(" / "),
     vehicle: model.vehicle,
@@ -1723,7 +1707,7 @@ export async function exportQuote(id) {
       dynamicPrices[`${label}价格来源`] = item.source || "";
     });
     return {
-      ...line.original, "客户询价图片": line.customerImageValidated && line.customerImage ? "已嵌入" : "", "匹配内部型号": line.internal, "属性（自制/调货）": line.attribute || "", "产品目录图片": line.catalogImage ? "已嵌入" : "暂无图片", "匹配OE号": line.oe, "匹配UF号": line.uf, "适用车型": line.vehicle, "适用车型（英文）": line.vehicleEnglish || vehicleToEnglish(line.vehicle),
+      ...line.original, "客户询价图片": line.customerImageValidated && line.customerImage ? "已嵌入" : "", "匹配内部型号": line.internal, "红色外壳原型号": line.matchedOriginalInternal || "", "属性（自制/调货）": line.attribute || "", "产品目录图片": line.catalogImage ? "已嵌入" : "暂无图片", "匹配OE号": line.oe, "匹配UF号": line.uf, "适用车型": line.vehicle, "适用车型（英文）": line.vehicleEnglish || vehicleToEnglish(line.vehicle),
       "匹配依据": line.matchedKind ? `通过${line.matchedKind}命中` : "", ...dynamicPrices, "型号来源": line.modelSource, "校对状态": line.reviewStatus, "异常说明": line.issue,
     };
   });

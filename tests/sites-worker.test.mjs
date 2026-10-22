@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { access } from "node:fs/promises";
 import test from "node:test";
 import worker from "../worker/index.js";
+import { normalizeRedShellInternal } from "../server/red-shell.mjs";
 
 test("serves existing static assets without a fallback", async () => {
   const calls = [];
@@ -65,4 +66,13 @@ test("emits the files required by Sites packaging", async () => {
   await access(new URL("../dist/client/index.html", import.meta.url));
   await access(new URL("../dist/server/index.js", import.meta.url));
   await access(new URL("../dist/.openai/hosting.json", import.meta.url));
+});
+
+test("red-shell catalog variants use standard internal code for quote output", () => {
+  const red = { commonName: "丰田凯美瑞（红色）", vehicle: "丰田凯美瑞（红色）" };
+  assert.equal(normalizeRedShellInternal("DQ91084812", red), "DQ910848");
+  assert.equal(normalizeRedShellInternal("DQ910848", red), "DQ910848");
+  assert.equal(normalizeRedShellInternal("DQ91084812", { commonName: "丰田凯美瑞" }), "DQ91084812");
+  assert.equal(normalizeRedShellInternal("DQ91084812", null), "DQ91084812");
+  assert.equal(normalizeRedShellInternal("DQ9101AR", { commonName: "红色外壳" }), "DQ9101AR");
 });
