@@ -580,3 +580,15 @@ footer { min-height: 45px; padding: 0 2px; display: flex; align-items: center; j
   .toast { left: 14px; right: 14px; top: 66px; min-width: 0; }
   footer { align-items: flex-start; flex-direction: column; justify-content: center; gap: 3px; }
 }
+
+/* All confirmed matches can be corrected without downloading a supplement file. */
+.model-inline-edit { display: inline-flex; align-items: center; gap: 3px; padding: 3px 6px; border: 1px solid #c9d8f5; border-radius: 7px; background: #f5f8ff; color: #1755b6; font-size: 9px; font-weight: 700; cursor: pointer; margin: 3px 0 0 4px; white-space: nowrap; }
+.model-inline-edit:hover { background: #eaf2ff; border-color: var(--blue); }
+.red-shell-note { display: block; color: #aa5337; font-size: 9px; margin-top: 3px; white-space: nowrap; }
+.in-result-model-editor { margin: 4px 14px 16px; border: 1px solid #cad8f1; border-radius: 10px; background: #f8faff; }
+.editable-model-value { display: inline-block; min-width: 110px; }
+.inline-quote-edit { display: grid; grid-template-columns: minmax(130px, 1fr) 70px 70px; gap: 5px; min-width: 280px; }
+.inline-quote-edit input { min-width: 0; height: 31px; padding: 0 7px; border: 1px solid #cad8f1; border-radius: 6px; font-size: 10px; }
+.inline-quote-edit button { border: 1px solid #cad8f1; border-radius: 6px; background: #fff; color: #17469e; padding: 5px 8px; font-size: 10px; cursor: pointer; }
+.inline-quote-edit button:first-of-type { background: var(--blue); color: #fff; border-color: var(--blue); }
+@media (max-width: 700px) { .in-result-model-editor { grid-template-columns: 1fr; } .inline-quote-edit { min-width: 235px; grid-template-columns: 1fr 1fr; } .inline-quote-edit input:first-child { grid-column: 1 / -1; } }
