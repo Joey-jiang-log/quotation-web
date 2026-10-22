@@ -448,7 +448,7 @@ function ModelSearch({ onReviewCreated, showToast }) {
     if (!model) return;
     const codes = classifiedModelCodes(model);
     setEditingModelQuery(item.query);
-    setModelEditInputs({ internal: model.displayInternal || model.internal, oe: codes.oeNos.join(" / "), uf: codes.ufNos.join(" / ") });
+    setModelEditInputs({ internal: model.internal, oe: codes.oeNos.join(" / "), uf: codes.ufNos.join(" / ") });
   };
   const saveModelEdit = async (item) => {
     const targetInternal = String(modelEditInputs.internal || "").trim();
@@ -825,7 +825,7 @@ function QuoteResult({ result, onUpdate, showToast, onKnowledgeUpdated }) {
     const line = result.lines[lineIndex];
     if (!line) return;
     setEditingLine(lineIndex);
-    setQuoteEditInputs({ internal: line.internal || "", oe: line.oe || "", uf: line.uf || "" });
+    setQuoteEditInputs({ internal: line.matchedOriginalInternal || line.internal || "", oe: line.oe || "", uf: line.uf || "" });
   };
   const saveQuoteEdit = async (lineIndex) => {
     const targetInternal = String(quoteEditInputs.internal || "").trim();
